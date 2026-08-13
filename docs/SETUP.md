@@ -197,6 +197,13 @@ python scripts/heartbeat.py --max-new 3
 
 先用 `medium` 跑一周看效果，觉得杠点不够刁钻再往上调。
 
+**关于 `--model`**：默认 `claude-sonnet-5`。想更省用 `claude-haiku-4-5`，
+想更强用 `claude-opus-5`。也可以在 `.env` 里设 `MADTED_MODEL` 长期生效。
+各模型价差和省钱开关见下面的「成本估算」。
+
+**关于 `--max-deliberate`**（默认 4）：本轮最多问几次 Claude。雷达可能筛出 10 条
+候选，判定「划走」的那几次同样花钱——这个上限就是用来砍最坏情况的。
+
 ---
 
 ## 第五步：定时运行
@@ -297,14 +304,38 @@ print('利刃/钝刀/禁用', m.angle_preference())
 
 ## 成本估算
 
-粗算，按 `medium` effort、每 4 小时一次（一天 6 次）：
+**贵的不是输入，是输出。** 实测每次判定一条帖子约 **8K 输入 token**（人设文档占大头），
+输出约 2K（内心独白九个字段 + thinking）。而输出单价是输入的 5 倍。
 
-- 每次 heartbeat：约 3-5 次 Claude 调用（每条候选帖一次）
-- 人设文档约 6K token，靠 prompt caching 后续按缓存价（约 1/10）计费
-- 每天大约 20-30 次调用
+按 `medium` effort、`--max-deliberate 4`、每 4 小时一次（一天 6 次）粗算：
 
-用 `claude-opus-5`（$5/$25 per MTok）大约每天几毛到一块多人民币。
-想更省就换 `--effort low`，或者把 `--max-new` 调小。
+| 模型 | 单价（输入/输出，每百万 token） | 每次 heartbeat | 每天 |
+|---|---|---|---|
+| `claude-haiku-4-5` | $1 / $5 | 约 $0.05 | **约 $0.3（¥2）** |
+| `claude-sonnet-5` ← 默认 | $3 / $15（8-31 前 $2/$10） | 约 $0.11 | **约 $0.6（¥4.5）** |
+| `claude-opus-5` | $5 / $25 | 约 $0.26 | **约 $1.6（¥11）** |
+
+数字是估算，实际取决于输出长度和当天 feed 里有多少候选帖。**先跑一天看账单再调。**
+
+### 省钱的四个开关，按效果排序
+
+1. **换模型**——省得最多。默认已经是 `claude-sonnet-5`，比 Opus 省一多半：
+   ```bash
+   python scripts/heartbeat.py --model claude-haiku-4-5   # 最省
+   export MADTED_MODEL=claude-haiku-4-5                   # 或者写进 .env 长期生效
+   ```
+   注意 Haiku 抬杠质量会下降——它挖隐藏假设的本事不如 Sonnet。建议先用 Sonnet
+   跑几天，觉得质量有富余再降。
+
+2. **`--max-deliberate`**（默认 4）——雷达可能筛出 10 条候选，判定"划走"的那几次
+   也是要花钱的。这个上限直接砍掉最坏情况。调到 2 能再省一半。
+
+3. **`--effort low`**——主要压缩 thinking 的长度，也就是压最贵的输出侧。
+
+4. **`--max-new`**——只影响发几条评论，对成本影响反而最小（因为划走也花钱）。
+
+**几乎不花钱的操作**：`--dry-run` 仍然会调 Claude（照样计费），只是不发帖；
+真正免费的是 `daily_report.py --no-llm` 和 `preflight.py`。
 
 ---
 

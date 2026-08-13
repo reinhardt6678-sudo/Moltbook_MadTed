@@ -91,6 +91,8 @@ class MoltbookClient:
         self.base_url = base_url.rstrip("/")
         self.dry_run = dry_run
         self._throttle = _Throttle()
+        # 记住每类操作实际走通的候选端点下标，避免每次都从头试
+        self._resolved: dict[str, int] = {}
         self._session = requests.Session()
         self._session.headers.update(
             {
@@ -150,9 +152,13 @@ class MoltbookClient:
                 continue
 
             if not resp.ok:
-                # 4xx 不重试——请求本身有问题
+                # 4xx 不重试——请求本身有问题。
+                # 把响应体带进异常消息：端点/字段名对不上时，服务端返回的
+                # 说明往往直接point出错在哪，比光看状态码省事得多。
+                body = resp.text[:500].strip()
+                detail = f"，响应：{body}" if body else ""
                 raise MoltbookError(
-                    f"{method} {path} 失败: {resp.status_code}",
+                    f"{method} {path} 失败: {resp.status_code}{detail}",
                     resp.status_code,
                     resp.text[:500],
                 )
@@ -162,6 +168,47 @@ class MoltbookClient:
             return resp.json()
 
         raise MoltbookError(f"{method} {path} 重试 {max_retries} 次后仍失败: {last_error}")
+
+    def _try_paths(
+        self,
+        method: str,
+        attempts: list[tuple[str, dict[str, Any] | None]],
+        *,
+        cache_key: str,
+        params: dict[str, Any] | None = None,
+    ) -> Any:
+        """依次尝试多个候选端点，404 就换下一个。
+
+        端点路径整理自第三方资料，各来源写法不一（评论有的写
+        /posts/{id}/comments，有的写 /comments）。**404 意味着请求压根没被
+        处理**，所以换一条路径重试是安全的——不会重复发出内容。
+
+        第一条走通的会被记住，本进程后续直接用它，不再逐个试。
+        dry-run 下不记忆，因为根本没真的碰过服务端。
+        """
+        order = list(range(len(attempts)))
+        hit = self._resolved.get(cache_key)
+        if hit is not None and hit < len(attempts):
+            order.remove(hit)
+            order.insert(0, hit)
+
+        last_error: MoltbookError | None = None
+        for index in order:
+            path, payload = attempts[index]
+            try:
+                result = self._request(method, path, params=params, json=payload)
+            except MoltbookError as exc:
+                if exc.status == 404:
+                    log.info("%s %s → 404，换下一个候选端点", method, path)
+                    last_error = exc
+                    continue
+                raise
+            if not self.dry_run and self._resolved.get(cache_key) != index:
+                self._resolved[cache_key] = index
+                log.info("确认可用端点：%s %s", method, path)
+            return result
+
+        raise last_error or MoltbookError(f"{method} 的候选端点全部不可用（{cache_key}）")
 
     # ---------- 读取 ----------
 
@@ -175,8 +222,16 @@ class MoltbookClient:
 
     def get_replies(self, post_id: str, *, limit: int = 100) -> list[dict]:
         """拉取某个帖子下的回复。"""
-        data = self._request("GET", f"/posts/{post_id}/replies", params={"limit": limit})
-        return _unwrap_list(data, "replies")
+        data = self._try_paths(
+            "GET",
+            [
+                (f"/posts/{post_id}/comments", None),
+                (f"/posts/{post_id}/replies", None),
+            ],
+            cache_key="get_replies",
+            params={"limit": limit},
+        )
+        return _unwrap_list(data, "comments", "replies")
 
     def get_notifications(self, *, unread_only: bool = True) -> list[dict]:
         """拉取通知——这是发现『对方回复了我』的主要途径。"""
@@ -199,8 +254,14 @@ class MoltbookClient:
         if wait > 0:
             log.info("评论冷却中，等待 %.0fs", wait)
             time.sleep(wait)
-        result = self._request(
-            "POST", "/comments", json={"post_id": post_id, "content": content}
+        result = self._try_paths(
+            "POST",
+            [
+                (f"/posts/{post_id}/comments", {"content": content}),
+                (f"/posts/{post_id}/replies", {"content": content}),
+                ("/comments", {"post_id": post_id, "content": content}),
+            ],
+            cache_key="create_comment",
         )
         self._throttle.mark("comment")
         return result or {}
@@ -220,14 +281,18 @@ class MoltbookClient:
         return self._throttle.remaining_cooldown("post", RATE_LIMITS["post_cooldown_sec"]) == 0
 
 
-def _unwrap_list(data: Any, key: str) -> list[dict]:
-    """API 有时返回 {"posts": [...]}，有时直接返回 [...]，统一成 list。"""
+def _unwrap_list(data: Any, *keys: str) -> list[dict]:
+    """API 有时返回 {"posts": [...]}，有时直接返回 [...]，统一成 list。
+
+    可以给多个候选键——不同端点对同一批数据的叫法不一致
+    （评论有的叫 comments 有的叫 replies）。
+    """
     if data is None:
         return []
     if isinstance(data, list):
         return data
     if isinstance(data, dict):
-        for candidate in (key, "data", "items", "results"):
+        for candidate in (*keys, "data", "items", "results"):
             value = data.get(candidate)
             if isinstance(value, list):
                 return value

@@ -21,6 +21,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 from brain import Brain  # noqa: E402
+from config import load_dotenv  # noqa: E402
 from memory import ANGLES, Memory  # noqa: E402
 
 log = logging.getLogger(__name__)
@@ -156,6 +157,7 @@ def main() -> None:
     args = parser.parse_args()
 
     logging.basicConfig(level=logging.INFO, format="%(levelname)s: %(message)s")
+    load_dotenv()
     path = generate(args.date, use_llm=not args.no_llm, effort=args.effort)
     print(path.read_text(encoding="utf-8"))
 

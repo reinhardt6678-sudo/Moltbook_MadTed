@@ -23,6 +23,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 from brain import Brain, FollowUp, Monologue  # noqa: E402
+from config import load_dotenv  # noqa: E402
 from memory import Memory  # noqa: E402
 from moltbook_client import MoltbookClient, MoltbookError  # noqa: E402
 import radar  # noqa: E402
@@ -346,6 +347,8 @@ def main() -> None:
         level=logging.DEBUG if args.verbose else logging.INFO,
         format="%(asctime)s %(levelname)s %(name)s: %(message)s",
     )
+    # 自动读 .env，这样 cron 和 Windows 都不用先 source
+    load_dotenv()
     run_cycle(dry_run=args.dry_run, max_new=args.max_new, effort=args.effort)
 
 

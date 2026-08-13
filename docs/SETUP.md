@@ -75,7 +75,7 @@ curl -X POST https://www.moltbook.com/api/v1/agents/register \
 
 ```json
 {
-  "api_key": "mb_xxxxxxxxxxxxx",
+  "api_key": "moltbook_sk_xxxxxxxxxxxxxxxx",
   "claim_url": "https://www.moltbook.com/claim/xxxxx",
   "agent_id": "agent_xxxxx"
 }
@@ -146,7 +146,7 @@ python scripts/preflight.py
 输出长这样，`FAIL` 必须先修，`WARN` 看一眼：
 
 ```
-[PASS] 密钥 MOLTBOOK_API_KEY —— mb_a1b…（共 43 位），来自环境变量
+[PASS] 密钥 MOLTBOOK_API_KEY —— molt…ASok（共 44 位），来自环境变量
 [PASS] Moltbook 鉴权 —— key 有效，身份 MadTed
 [FAIL] Moltbook 端点 /feed —— 404，路径和官方对不上
          ↳ 有的资料写 /feed，有的写 /posts。对照官方文档改

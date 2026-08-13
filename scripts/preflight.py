@@ -45,7 +45,7 @@ FEED_FIELDS = {
     "标题": ("title",),
     "正文": ("content", "body", "text"),
     "作者": ("author",),
-    "社区": ("submolt", "community"),
+    "社区": ("submolt_name", "submolt", "community"),
     "赞数": ("upvotes", "score", "karma", "likes"),
     "评论数": ("comment_count", "comments_count", "num_comments", "replies"),
 }
@@ -105,9 +105,14 @@ class Report:
 
 
 def mask(secret: str) -> str:
-    """只暴露前缀和长度——自检输出可能被贴到 issue 里，绝不打印完整 key。"""
-    prefix = secret[:6]
-    return f"{prefix}…（共 {len(secret)} 位）"
+    """只露头尾各 4 位——自检输出可能被贴进 issue，绝不打印完整 key。
+
+    Moltbook 的 key 统一以 moltbook_sk_ 开头，只看前缀分不出是哪一把，
+    所以尾部也留 4 位，方便核对「加载的是不是我以为的那个 key」。
+    """
+    if len(secret) <= 12:
+        return f"（共 {len(secret)} 位，太短，八成填错了）"
+    return f"{secret[:4]}…{secret[-4:]}（共 {len(secret)} 位）"
 
 
 def _ver_tuple(text: str) -> tuple[int, ...]:
@@ -169,7 +174,7 @@ def check_env_keys(r: Report, injected: set[str] | None) -> None:
         r.ok(".env 文件", "已找到并加载")
 
     for key, hint in (
-        ("MOLTBOOK_API_KEY", "注册 agent 后返回的 mb_... key，见 docs/SETUP.md 第一步"),
+        ("MOLTBOOK_API_KEY", "注册 agent 后返回的 moltbook_sk_... key，见 docs/SETUP.md 第一步"),
         ("ANTHROPIC_API_KEY", "从 console.anthropic.com 拿，用来生成独白和回复"),
     ):
         value = os.environ.get(key, "").strip()

@@ -111,6 +111,7 @@ Moltbook 的 agent 靠平台 **Heartbeat 机制**驱动，约每 4 小时唤醒�
 | `scripts/brain.py` | 调 Claude 生成内心独白与回复。人设文档在这里当 system prompt（带 prompt caching）。 |
 | `scripts/heartbeat.py` | 主流程：先跟进老讨论串 → 再开新杠 → 更新记忆。 |
 | `scripts/daily_report.py` | 每日战报。`--no-llm` 可只看原始统计。 |
+| `scripts/show_monologue.py` | 按人设格式打印当天内心独白。**想知道它为什么挑这条帖子就看这个。** |
 | `tests/` | 26 个单元测试，纯逻辑不需要 key。 |
 
 ```

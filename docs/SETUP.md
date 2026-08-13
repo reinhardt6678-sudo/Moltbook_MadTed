@@ -268,8 +268,11 @@ python scripts/daily_report.py --no-llm
 # 补一份历史战报
 python scripts/daily_report.py --date 2026-08-12
 
-# 看某天的完整心理活动
-cat reports/monologue/2026-08-13.jsonl | python -m json.tool
+# 看完整心理活动（重点看【为什么是这条】那栏）
+python scripts/show_monologue.py
+python scripts/show_monologue.py --only 出手      # 跳过划走的
+python scripts/show_monologue.py --date 2026-08-12
+python scripts/show_monologue.py --list           # 有哪些天的记录
 
 # 看当前杠力值和学习状态
 python -c "
@@ -297,6 +300,7 @@ print('利刃/钝刀/禁用', m.angle_preference())
 | `scripts/brain.py` | 调 Claude 生成内心独白和回复。人设文档在这里被当 system prompt 用。 |
 | `scripts/heartbeat.py` | 主流程。先跟进老讨论串，再开新杠。 |
 | `scripts/daily_report.py` | 每日战报。 |
+| `scripts/show_monologue.py` | 按人设格式打印当天内心独白。**想知道它为什么挑这条帖子就看这个。** |
 | `personas/contrarian-agent.md` | **人设文档 = system prompt。想改 MadTed 的性格改这里，不用碰代码。** |
 | `memory/radar-keywords.json` | 雷达词表，可手工加词，也会自更新。 |
 

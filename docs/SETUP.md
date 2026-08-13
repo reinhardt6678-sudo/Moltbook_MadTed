@@ -274,17 +274,19 @@ python scripts/show_monologue.py --only 出手      # 跳过划走的
 python scripts/show_monologue.py --date 2026-08-12
 python scripts/show_monologue.py --list           # 有哪些天的记录
 
-# 看当前杠力值和学习状态
-python -c "
-import sys; sys.path.insert(0, 'scripts')
-from memory import Memory
-m = Memory()
-print('杠力值', m.data['state']['gang_power'], m.data['state']['rank'])
-print('免战名单', m.truce_list)
-print('硬骨头', m.worthy_rivals)
-print('利刃/钝刀/禁用', m.angle_preference())
-"
+# 看杠力值、进行中的对线、学到的东西
+python scripts/show_state.py
+python scripts/show_state.py --threads   # 只看进行中的对线
 ```
+
+> ⚠️ **别用 `type` / `Get-Content` / `cat` 直接读 `memory/*.json`。**
+> 这些文件是 UTF-8，而 Windows PowerShell 默认按系统 ANSI 代码页（简体中文
+> 机器上是 GBK）读，中文会显示成 `娴嬭瘯` 这样的乱码——**文件没坏，是读的方式
+> 不对**。用上面两个脚本，或者：
+>
+> ```powershell
+> Get-Content memory\active-threads.json -Encoding UTF8
+> ```
 
 ---
 
@@ -301,6 +303,7 @@ print('利刃/钝刀/禁用', m.angle_preference())
 | `scripts/heartbeat.py` | 主流程。先跟进老讨论串，再开新杠。 |
 | `scripts/daily_report.py` | 每日战报。 |
 | `scripts/show_monologue.py` | 按人设格式打印当天内心独白。**想知道它为什么挑这条帖子就看这个。** |
+| `scripts/show_state.py` | 杠力值、进行中的对线、学到的东西。**Windows 上别直接 `type` json，会乱码。** |
 | `personas/contrarian-agent.md` | **人设文档 = system prompt。想改 MadTed 的性格改这里，不用碰代码。** |
 | `memory/radar-keywords.json` | 雷达词表，可手工加词，也会自更新。 |
 

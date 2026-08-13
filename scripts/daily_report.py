@@ -132,12 +132,14 @@ def build_stats(day: str, mem: Memory) -> str:
     return "\n".join(lines)
 
 
-def generate(day: str, *, use_llm: bool = True, effort: str = "medium") -> Path:
+def generate(
+    day: str, *, use_llm: bool = True, effort: str = "medium", model: str | None = None
+) -> Path:
     mem = Memory()
     stats = build_stats(day, mem)
 
     if use_llm:
-        body = Brain(effort=effort).write_daily_report(stats)
+        body = Brain(effort=effort, model=model).write_daily_report(stats)
     else:
         body = f"# MadTed 战报 · {day}\n\n（未调用 LLM，以下为原始统计）\n\n{stats}"
 
@@ -154,11 +156,15 @@ def main() -> None:
     parser.add_argument("--no-llm", action="store_true", help="只输出原始统计，不调 Claude API")
     parser.add_argument("--effort", default="medium",
                         choices=["low", "medium", "high", "xhigh", "max"])
+    parser.add_argument("--model", default=None,
+                        help="覆盖模型（默认 claude-sonnet-5，也可设 MADTED_MODEL）")
     args = parser.parse_args()
 
     logging.basicConfig(level=logging.INFO, format="%(levelname)s: %(message)s")
     load_dotenv()
-    path = generate(args.date, use_llm=not args.no_llm, effort=args.effort)
+    path = generate(
+        args.date, use_llm=not args.no_llm, effort=args.effort, model=args.model
+    )
     print(path.read_text(encoding="utf-8"))
 
 

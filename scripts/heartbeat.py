@@ -214,9 +214,14 @@ def open_new_battles(
     threads: dict,
     *,
     max_new: int,
+    max_deliberate: int,
     dry_run: bool,
 ) -> tuple[int, list[str]]:
-    """浏览 feed，挑杠点最多的帖子出手。返回 (出手数, 放弃理由列表)。"""
+    """浏览 feed，挑杠点最多的帖子出手。返回 (出手数, 放弃理由列表)。
+
+    max_deliberate 是本轮最多问几次 Claude 的硬上限——雷达可能筛出 10 条候选，
+    如果前几条都判定划走，不设上限就会把 10 条全问一遍，钱花在没出手的判断上。
+    """
     keywords = radar.load_keywords()
     sharp, blunt, banned = mem.angle_preference()
 
@@ -243,9 +248,14 @@ def open_new_battles(
     skipped_summaries: list[str] = []
     engaged = 0
 
+    deliberated = 0
     for cand in accepted:
         if engaged >= max_new:
             break
+        if deliberated >= max_deliberate:
+            log.info("已问满 %d 次 Claude，本轮不再深挖（省钱上限）", max_deliberate)
+            break
+        deliberated += 1
 
         monologue: Monologue | None = brain.deliberate(
             _format_post(cand.post),
@@ -305,9 +315,16 @@ def open_new_battles(
 # ---------- 主流程 ----------
 
 
-def run_cycle(*, dry_run: bool = False, max_new: int = 3, effort: str = "medium") -> None:
+def run_cycle(
+    *,
+    dry_run: bool = False,
+    max_new: int = 3,
+    effort: str = "medium",
+    model: str | None = None,
+    max_deliberate: int = 4,
+) -> None:
     client = MoltbookClient.from_env(dry_run=dry_run)
-    brain = Brain(effort=effort)
+    brain = Brain(effort=effort, model=model)
     mem = Memory()
     threads = _load_threads()
 
@@ -320,7 +337,13 @@ def run_cycle(*, dry_run: bool = False, max_new: int = 3, effort: str = "medium"
     _reap_cold_threads(mem, threads)
 
     engaged, restraint = open_new_battles(
-        client, brain, mem, threads, max_new=max_new, dry_run=dry_run
+        client,
+        brain,
+        mem,
+        threads,
+        max_new=max_new,
+        max_deliberate=max_deliberate,
+        dry_run=dry_run,
     )
     log.info("阶段2：开了 %d 个新杠，忍住了 %d 条", engaged, len(restraint))
 
@@ -340,6 +363,18 @@ def main() -> None:
         choices=["low", "medium", "high", "xhigh", "max"],
         help="Claude 的 effort 档位，越高越能挖出刁钻角度但也越贵",
     )
+    parser.add_argument(
+        "--model",
+        default=None,
+        help="覆盖模型（默认 claude-sonnet-5，也可设 MADTED_MODEL 环境变量）。"
+        "更省：claude-haiku-4-5；更强：claude-opus-5",
+    )
+    parser.add_argument(
+        "--max-deliberate",
+        type=int,
+        default=4,
+        help="本轮最多问几次 Claude（含判定划走的）。省钱的主要开关",
+    )
     parser.add_argument("--verbose", action="store_true")
     args = parser.parse_args()
 
@@ -349,7 +384,13 @@ def main() -> None:
     )
     # 自动读 .env，这样 cron 和 Windows 都不用先 source
     load_dotenv()
-    run_cycle(dry_run=args.dry_run, max_new=args.max_new, effort=args.effort)
+    run_cycle(
+        dry_run=args.dry_run,
+        max_new=args.max_new,
+        effort=args.effort,
+        model=args.model,
+        max_deliberate=args.max_deliberate,
+    )
 
 
 if __name__ == "__main__":

@@ -7,6 +7,7 @@
 from __future__ import annotations
 
 import logging
+import os
 from pathlib import Path
 from typing import Literal
 
@@ -15,8 +16,34 @@ from pydantic import BaseModel, Field
 
 log = logging.getLogger(__name__)
 
-MODEL = "claude-opus-5"
+# 默认 Sonnet 5：抬杠质量够用，价格比 Opus 便宜一多半（$3/$15 vs $5/$25，
+# 2026-08-31 前还是 $2/$10 的introductory价）。
+# 换模型：设 MADTED_MODEL 环境变量，或加 --model 参数。
+DEFAULT_MODEL = "claude-sonnet-5"
+MODEL = os.environ.get("MADTED_MODEL", DEFAULT_MODEL)
+
+MAX_TOKENS = 4096
+
+# 这些模型不认 adaptive thinking 和 effort，得用旧的 budget_tokens 写法。
+# 参数传错会直接 400，所以按模型分两套拼。
+_LEGACY_THINKING_MODELS = {"claude-haiku-4-5"}
+
+# effort 档位换算成旧模型的思考预算（必须小于 MAX_TOKENS）
+_EFFORT_TO_BUDGET = {"low": 1024, "medium": 2048, "high": 3072, "xhigh": 3072, "max": 3072}
+
 PERSONA_PATH = Path(__file__).resolve().parent.parent / "personas" / "contrarian-agent.md"
+
+
+def tuning_params(model: str, effort: str) -> dict:
+    """按模型拼出 thinking / effort 参数。
+
+    Opus 5 和 Sonnet 5 用 adaptive thinking + effort；
+    Haiku 4.5 只认 budget_tokens，给它传 effort 会报 400。
+    """
+    if model in _LEGACY_THINKING_MODELS:
+        budget = _EFFORT_TO_BUDGET.get(effort, 2048)
+        return {"thinking": {"type": "enabled", "budget_tokens": budget}}
+    return {"thinking": {"type": "adaptive"}, "output_config": {"effort": effort}}
 
 
 class Monologue(BaseModel):
@@ -117,20 +144,27 @@ def _memory_context(
 
 
 class Brain:
-    def __init__(self, client: anthropic.Anthropic | None = None, *, effort: str = "medium"):
+    def __init__(
+        self,
+        client: anthropic.Anthropic | None = None,
+        *,
+        effort: str = "medium",
+        model: str | None = None,
+    ):
         self.client = client or anthropic.Anthropic()
         self.effort = effort
+        self.model = model or MODEL
+        log.info("大脑用的模型：%s（effort=%s）", self.model, effort)
 
     def _parse(self, schema: type[BaseModel], system: list[dict], user: str) -> BaseModel | None:
         try:
             response = self.client.messages.parse(
-                model=MODEL,
-                max_tokens=4096,
-                thinking={"type": "adaptive"},
-                output_config={"effort": self.effort},
+                model=self.model,
+                max_tokens=MAX_TOKENS,
                 system=system,
                 messages=[{"role": "user", "content": user}],
                 output_format=schema,
+                **tuning_params(self.model, self.effort),
             )
         except anthropic.APIStatusError as exc:
             log.error("Claude API 调用失败 (%s): %s", exc.status_code, exc.message)
@@ -199,10 +233,8 @@ class Brain:
         )
         try:
             response = self.client.messages.create(
-                model=MODEL,
-                max_tokens=4096,
-                thinking={"type": "adaptive"},
-                output_config={"effort": self.effort},
+                model=self.model,
+                max_tokens=MAX_TOKENS,
                 system=system,
                 messages=[
                     {
@@ -210,6 +242,7 @@ class Brain:
                         "content": f"今天的原始数据：\n\n{stats_summary}\n\n请写成 markdown 战报。",
                     }
                 ],
+                **tuning_params(self.model, self.effort),
             )
         except anthropic.APIStatusError as exc:
             log.error("日报生成失败: %s", exc.message)

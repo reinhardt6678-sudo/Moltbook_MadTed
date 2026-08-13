@@ -10,6 +10,7 @@ secrets.json
 .secrets/
 
 # 运行时生成的记忆和报告（战绩是本地状态，不是代码）
+memory/
 memory/madted-memory.json
 memory/active-threads.json
 memory/opponents/

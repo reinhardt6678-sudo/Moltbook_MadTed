@@ -10,9 +10,17 @@
 
 ## 这是什么
 
-本仓库目前的产出是一份**人设 / 系统提示词文档**（persona prompt），不是可运行的程序。你可以把它作为 system prompt 喂给你的 Moltbook agent。
+一份**人设文档**（当 system prompt 用）+ 一套**可运行的 Python 脚本**，实现雷达选题、中文内心独白、学习复盘和每日战报。
 
-📄 **[personas/contrarian-agent.md](personas/contrarian-agent.md)** —— 完整人设文档
+📄 **[personas/contrarian-agent.md](personas/contrarian-agent.md)** —— 人设文档（改性格改这里，不用碰代码）
+🚀 **[docs/SETUP.md](docs/SETUP.md)** —— 从注册到上线的接入指南
+
+```bash
+pip install -r requirements.txt
+cp .env.example .env          # 填 MOLTBOOK_API_KEY 和 ANTHROPIC_API_KEY
+python -m pytest tests/ -q    # 26 个测试，不需要任何 key
+python scripts/heartbeat.py --dry-run --max-new 2   # 空跑，不真的发帖
+```
 
 ## MadTed 的设计要点
 
@@ -90,32 +98,40 @@ Moltbook 的 agent 靠平台 **Heartbeat 机制**驱动，约每 4 小时唤醒�
 
 > 一天有效追问 3 轮扎实的新角度，比一天刷 30 条车轱辘话更有战斗力。
 
-## 目录结构
+## 代码结构
+
+| 文件 | 作用 |
+|---|---|
+| `scripts/moltbook_client.py` | Moltbook API 封装。限流、退避重试、发帖/评论冷却。**改端点只改这个文件。** |
+| `scripts/radar.py` | 杠点雷达。纯逻辑给帖子打分排序，LLM 只看排名靠前的，省 token。 |
+| `scripts/memory.py` | 记忆与学习。杠力值、冷场四类归因、免战名单、角度统计、禁用超频招式。 |
+| `scripts/brain.py` | 调 Claude 生成内心独白与回复。人设文档在这里当 system prompt（带 prompt caching）。 |
+| `scripts/heartbeat.py` | 主流程：先跟进老讨论串 → 再开新杠 → 更新记忆。 |
+| `scripts/daily_report.py` | 每日战报。`--no-llm` 可只看原始统计。 |
+| `tests/` | 26 个单元测试，纯逻辑不需要 key。 |
 
 ```
-personas/
-  contrarian-agent.md       # 人设主文档
-memory/                     # （运行时生成）
-  madted-memory.json        # 战绩、名单、统计
-  radar-keywords.json       # 杠点雷达词表
-  opponents/                # 对手档案卡片
-archive/                    # （运行时生成）
-  hall-of-fame.md           # 名人堂
-  hall-of-shame.md          # 耻辱柱
-  counter-strikes.md        # 偷师本
-reports/                    # （运行时生成）
-  daily/                    # 每日战报
-  monthly/                  # 月度回顾
+personas/contrarian-agent.md   # 人设 = system prompt
+scripts/                       # 可运行实现
+tests/                         # 单元测试
+docs/SETUP.md                  # 接入指南
+memory/radar-keywords.json     # 雷达词表（可手工加词，也会自更新）
+memory/madted-memory.json      # （运行时生成）战绩、名单、统计
+reports/monologue/*.jsonl      # （运行时生成）每日完整心理活动
+reports/daily/*.md             # （运行时生成）每日战报
 ```
 
 ## 状态
 
 - [x] 人设文档 / 系统提示词
-- [x] 内心独白格式规范
-- [x] 学习复盘机制设计
-- [x] 每日战报模板
+- [x] 内心独白格式规范 + 结构化输出实现
+- [x] 学习复盘机制（设计 + 实现 + 测试）
+- [x] 每日战报（模板 + 生成脚本）
 - [x] 九项扩展功能规格 + 数据结构定义
-- [ ] 接入 Moltbook 的可运行实现
+- [x] 杠点雷达、杠力值、对手档案、忍住了计数器 —— 已实现
+- [ ] 名人堂/耻辱柱、自杠日、月度长文 —— 规格已定，待实现
+
+> ⚠️ `moltbook.com` 在开发环境中无法直接访问，`moltbook_client.py` 的端点整理自公开教程和第三方 SDK。首次接入请对照 [官方开发者文档](https://www.moltbook.com/developers) 核实，端点全部集中在一个文件里，改起来很快。
 
 ---
 

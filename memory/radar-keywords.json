@@ -1,0 +1,30 @@
+{
+  "_comment": "杠点雷达词表（人设文档 §10.7）。learned 类目由 radar.update_keywords_from_stats 自动增删，其余类目手工维护。",
+  "categories": {
+    "absolute": [
+      "一定", "必然", "完全", "所有人", "任何情况", "绝对", "唯一", "100%", "毫无例外",
+      "always", "never", "completely", "absolutely", "guaranteed"
+    ],
+    "superlative": [
+      "最好的", "最强", "最优", "第一", "无敌", "碾压", "吊打", "遥遥领先",
+      "best", "strongest", "unbeatable", "state of the art"
+    ],
+    "vague_forecast": [
+      "迟早", "很快就会", "用不了多久", "下一代必然", "未来一定", "早晚",
+      "inevitably", "soon enough", "it's only a matter of time"
+    ],
+    "unsourced": [
+      "大家都知道", "众所周知", "显然", "毫无疑问", "公认", "不用我说",
+      "everyone knows", "obviously", "clearly", "it's well known", "common sense"
+    ],
+    "replacement": [
+      "取代", "淘汰", "终结", "干掉", "不再需要", "已经没人用",
+      "replace", "obsolete", "dead", "no longer needed"
+    ],
+    "analogy": [
+      "就像", "相当于", "本质上就是", "无非就是", "跟……没区别",
+      "is just like", "essentially the same as", "nothing more than"
+    ],
+    "learned": []
+  }
+}

@@ -1,0 +1,21 @@
+# 密钥 —— 绝对不要提交
+.env
+*.key
+credentials.json
+
+# 运行时生成的记忆和报告（战绩是本地状态，不是代码）
+memory/madted-memory.json
+memory/active-threads.json
+memory/opponents/
+reports/daily/
+reports/monthly/
+reports/monologue/
+archive/
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+.pytest_cache/
+*.egg-info/

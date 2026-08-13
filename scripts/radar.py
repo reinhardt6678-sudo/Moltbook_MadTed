@@ -66,6 +66,10 @@ class Candidate:
     def title(self) -> str:
         return str(self.post.get("title") or "")
 
+    @property
+    def submolt(self) -> str:
+        return submolt_of(self.post)
+
     def summary(self) -> str:
         """一行摘要，喂给 LLM 时用。"""
         return f"[{self.score:.1f}分] 《{self.title}》 —— @{self.author}"
@@ -83,6 +87,23 @@ def _text_of(post: dict) -> str:
         str(post.get("content") or post.get("body") or post.get("text") or ""),
     ]
     return "\n".join(parts)
+
+
+def submolt_of(post: dict) -> str:
+    """取帖子所属社区名。
+
+    实际 API 返回的是 submolt_name（2026-08 实测），但不同资料里也写过
+    submolt / community，都兼容一下——读不到会让低产话题过滤静默失效。
+    """
+    for key in ("submolt_name", "submolt", "community"):
+        value = post.get(key)
+        if isinstance(value, str) and value:
+            return value
+        if isinstance(value, dict):  # 有的实现把社区包成对象
+            name = value.get("name") or value.get("slug")
+            if name:
+                return str(name)
+    return ""
 
 
 def _comment_count(post: dict) -> int:
@@ -161,7 +182,7 @@ def score_post(
         candidate.score *= 0.4
         candidate.reasons.append(f"@{author} 在免战名单里（历史零回应），降权")
 
-    submolt = str(post.get("submolt") or post.get("community") or "").lower()
+    submolt = submolt_of(post).lower()
     for topic in low_yield_topics:
         if topic.lower() in submolt or topic.lower() in text.lower():
             candidate.score *= 0.5

@@ -116,6 +116,32 @@ def test_low_yield_topic_downweights(keywords):
     assert filtered.score < normal.score
 
 
+@pytest.mark.parametrize(
+    "field_name",
+    ["submolt_name", "submolt", "community"],
+)
+def test_low_yield_topic_reads_every_submolt_field_name(keywords, field_name):
+    """实际 API 返回的是 submolt_name。
+
+    早期只认 submolt/community，导致低产话题过滤对真实 feed 完全失效——
+    不报错，只是静默不生效，比 404 难查得多。三种字段名都得认。
+    """
+    post = _post(title="这个一定有效", **{field_name: "memes"})
+    assert radar.submolt_of(post) == "memes"
+
+    normal = radar.score_post(_post(title="这个一定有效"), keywords)
+    filtered = radar.score_post(post, keywords, low_yield_topics=["memes"])
+    assert filtered.score < normal.score
+
+
+def test_submolt_accepts_nested_object():
+    assert radar.submolt_of({"submolt_name": {"name": "ai-agents"}}) == "ai-agents"
+
+
+def test_submolt_missing_returns_empty_string():
+    assert radar.submolt_of({"title": "无社区字段"}) == ""
+
+
 def test_keyword_selfupdate_promotes_and_demotes(tmp_path):
     path = tmp_path / "kw.json"
     path.write_text(

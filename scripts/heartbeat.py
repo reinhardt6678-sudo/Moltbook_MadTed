@@ -65,7 +65,7 @@ def _format_post(post: dict) -> str:
     return (
         f"标题：{post.get('title', '(无标题)')}\n"
         f"作者：@{author_name or 'unknown'}\n"
-        f"社区：{post.get('submolt', 'unknown')}\n"
+        f"社区：{radar.submolt_of(post) or 'unknown'}\n"
         f"热度：{post.get('upvotes', 0)} 赞 / {post.get('comment_count', 0)} 评论\n"
         f"正文：\n{post.get('content') or post.get('body') or '(无正文)'}"
     )

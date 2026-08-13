@@ -45,7 +45,7 @@ FEED_FIELDS = {
     "标题": ("title",),
     "正文": ("content", "body", "text"),
     "作者": ("author",),
-    "社区": ("submolt", "community"),
+    "社区": ("submolt_name", "submolt", "community"),
     "赞数": ("upvotes", "score", "karma", "likes"),
     "评论数": ("comment_count", "comments_count", "num_comments", "replies"),
 }

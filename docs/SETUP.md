@@ -117,6 +117,30 @@ set -a && source .env && set +a
 python -m pytest tests/ -q
 ```
 
+然后跑一次**上线前自检**——它会把密钥、目录权限、以及两个外部 API 的连通性
+一次查完，哪一项不对就直接告诉你改哪个文件：
+
+```bash
+python scripts/preflight.py
+```
+
+输出长这样，`FAIL` 必须先修，`WARN` 看一眼：
+
+```
+[PASS] 密钥 MOLTBOOK_API_KEY —— mb_a1b…（共 43 位），来自环境变量
+[PASS] Moltbook 鉴权 —— key 有效，身份 MadTed
+[FAIL] Moltbook 端点 /feed —— 404，路径和官方对不上
+         ↳ 有的资料写 /feed，有的写 /posts。对照官方文档改
+         ↳ moltbook_client.py 的 get_feed()。
+```
+
+**这一步专治本仓库最大的不确定性**：`moltbook_client.py` 的端点是从第三方资料
+整理的（原因见文件顶部说明），和官方对不上时会 404。自检会分别验
+`/agents/status` 和 `/feed` 两个端点，还会把 feed 实际返回的字段名和 `radar.py`
+需要的字段对一遍——字段名不一致的话雷达打分会静默失真，比 404 更难查。
+
+不想发网络请求就加 `--skip-api`，只查本地部分。
+
 ---
 
 ## 第三步：空跑验证
@@ -167,13 +191,38 @@ Moltbook 有 moderator bot（Clawd Clawderberg）专门清垃圾封号。
 
 ```cron
 # 每 4 小时跑一次 heartbeat
-0 */4 * * * cd /path/to/Moltbook_MadTed && .venv/bin/python scripts/heartbeat.py --max-new 3 >> logs/heartbeat.log 2>&1
+0 */4 * * * cd /path/to/Moltbook_MadTed && mkdir -p logs && .venv/bin/python scripts/heartbeat.py --max-new 3 >> logs/heartbeat.log 2>&1
 
 # 每天北京时间 22:00 出战报
-0 22 * * * cd /path/to/Moltbook_MadTed && .venv/bin/python scripts/daily_report.py >> logs/report.log 2>&1
+0 22 * * * cd /path/to/Moltbook_MadTed && mkdir -p logs && .venv/bin/python scripts/daily_report.py >> logs/report.log 2>&1
 ```
 
 （cron 用的是服务器本地时区，注意换算。）
+
+⚠️ **cron 的两个经典坑**，装完一定要验：
+
+1. **`logs/` 不存在则整条命令失败**，而且失败得很安静——重定向在命令执行前就报错了。
+   上面的 `mkdir -p logs` 就是干这个的（`scripts/preflight.py` 也会顺手建好）。
+2. **cron 不读你的 `.env`，也不读 `.bashrc`。** 交互式 shell 里能跑不代表 cron 里能跑。
+   两个办法二选一：
+
+   ```cron
+   # 办法 A：在命令里显式 source
+   0 */4 * * * cd /path/to/Moltbook_MadTed && mkdir -p logs && set -a && . ./.env && set +a && .venv/bin/python scripts/heartbeat.py --max-new 3 >> logs/heartbeat.log 2>&1
+   ```
+
+   办法 B：直接把两个 key 写在 crontab 文件顶部（记得 `chmod 600` 你的 crontab）。
+
+装好后别等 4 小时，先在**模拟 cron 的干净环境**里跑一次自检：
+
+```bash
+env -i HOME="$HOME" PATH=/usr/bin:/bin sh -c \
+  'cd /path/to/Moltbook_MadTed && .venv/bin/python scripts/preflight.py'
+```
+
+这一步验的是 Python 路径、依赖和目录权限在没有你 shell 配置的情况下还成不成立。
+注意自检本身会替你读 `.env`，而 `heartbeat.py` 不会——所以只要看到
+「密钥进环境变量」这条 WARN，就说明 cron 里必须补上面办法 A 或 B，否则照样拿不到 key。
 
 ---
 
@@ -210,6 +259,7 @@ print('利刃/钝刀/禁用', m.angle_preference())
 
 | 文件 | 作用 |
 |---|---|
+| `scripts/preflight.py` | 上线前自检。密钥、目录、端点、字段对齐一次查完。**部署卡住先跑它。** |
 | `scripts/moltbook_client.py` | Moltbook API 封装。限流、重试、冷却都在这里。**改端点只改这个文件。** |
 | `scripts/radar.py` | 杠点雷达。纯逻辑，给帖子打分排序，LLM 只看排名靠前的，省钱。 |
 | `scripts/memory.py` | 记忆与学习。杠力值、冷场归因、免战名单、角度统计。 |

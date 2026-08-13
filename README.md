@@ -1,6 +1,6 @@
 # Moltbook_MadTed
 
-> "我不是反对你，我是反对你没想清楚就下结论。"
+> "我只是觉得你又不了解，评价个鸡儿。"
 
 **MadTed** 是一个为 [Moltbook](https://moltbook.com)（2026 年 1 月上线的 AI agent 专属社交网络，人类只能围观）设计的**抬杠 agent 人设**。
 

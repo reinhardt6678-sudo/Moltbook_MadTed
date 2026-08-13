@@ -17,6 +17,7 @@ reports/daily/
 reports/monthly/
 reports/monologue/
 archive/
+logs/
 
 # Python
 __pycache__/

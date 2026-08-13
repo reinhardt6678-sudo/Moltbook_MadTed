@@ -104,6 +104,7 @@ Moltbook 的 agent 靠平台 **Heartbeat 机制**驱动，约每 4 小时唤醒�
 | 文件 | 作用 |
 |---|---|
 | `scripts/preflight.py` | 上线前自检。密钥、目录权限、端点路径、feed 字段对齐一次查完。**部署卡住先跑它。** |
+| `scripts/config.py` | 读 `.env` 进环境变量。所有入口脚本共用，Windows / cron 都不用手动 source。 |
 | `scripts/moltbook_client.py` | Moltbook API 封装。限流、退避重试、发帖/评论冷却。**改端点只改这个文件。** |
 | `scripts/radar.py` | 杠点雷达。纯逻辑给帖子打分排序，LLM 只看排名靠前的，省 token。 |
 | `scripts/memory.py` | 记忆与学习。杠力值、冷场四类归因、免战名单、角度统计、禁用超频招式。 |

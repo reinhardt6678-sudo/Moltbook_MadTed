@@ -27,6 +27,8 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
+from config import load_dotenv  # noqa: E402
+
 # 依赖的最低版本，和 requirements.txt 保持一致
 REQUIRED_PACKAGES = [
     ("anthropic", (0, 116, 0)),
@@ -100,33 +102,6 @@ class Report:
 
 
 # ---------- 工具函数 ----------
-
-
-def load_dotenv(path: Path) -> set[str] | None:
-    """把 .env 读进 os.environ（已存在的环境变量优先，不覆盖）。
-
-    返回本次真正注入的变量名——heartbeat.py 自己不读 .env，
-    所以"只在 .env 里、不在环境里"的 key 必须单独提醒，否则 cron 里会挂。
-    找不到 .env 时返回 None。
-    """
-    if not path.exists():
-        return None
-    injected: set[str] = set()
-    for raw in path.read_text(encoding="utf-8").splitlines():
-        line = raw.strip()
-        if not line or line.startswith("#"):
-            continue
-        if line.startswith("export "):
-            line = line[len("export "):]
-        key, sep, value = line.partition("=")
-        if not sep:
-            continue
-        key = key.strip()
-        value = value.strip().strip('"').strip("'")
-        if key and key not in os.environ:
-            os.environ[key] = value
-            injected.add(key)
-    return injected
 
 
 def mask(secret: str) -> str:
@@ -205,18 +180,6 @@ def check_env_keys(r: Report, injected: set[str] | None) -> None:
         else:
             source = "来自 .env" if key in injected else "来自环境变量"
             r.ok(f"密钥 {key}", f"{mask(value)}，{source}")
-
-    # 关键提醒：本脚本会替你读 .env，但 heartbeat.py / daily_report.py 不会。
-    # 只在 .env 里的 key 会让自检全绿、cron 却因为拿不到 key 而崩。
-    only_in_dotenv = injected & {"MOLTBOOK_API_KEY", "ANTHROPIC_API_KEY"}
-    if only_in_dotenv:
-        r.warn(
-            "密钥进环境变量",
-            f"{'、'.join(sorted(only_in_dotenv))} 目前只存在于 .env",
-            "自检会自己读 .env，但 heartbeat.py 只认环境变量。跑之前先：\n"
-            "    set -a && source .env && set +a\n"
-            "cron 里没有这一步就会失败，写法见 docs/SETUP.md 第五步。",
-        )
 
 
 def check_secret_not_tracked(r: Report) -> None:
@@ -455,7 +418,7 @@ def main() -> int:
     args = parser.parse_args()
 
     print("MadTed 上线前自检\n" + "=" * 44)
-    injected = load_dotenv(ROOT / ".env")
+    injected = load_dotenv()
     r = Report()
 
     check_python(r)

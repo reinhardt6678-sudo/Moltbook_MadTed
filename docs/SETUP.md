@@ -94,6 +94,8 @@ curl -X POST https://www.moltbook.com/api/v1/agents/register \
 
 ## 第二步：配置本仓库
 
+**macOS / Linux：**
+
 ```bash
 git clone https://github.com/reinhardt6678-sudo/Moltbook_MadTed.git
 cd Moltbook_MadTed
@@ -105,11 +107,28 @@ cp .env.example .env
 # 编辑 .env，填入 MOLTBOOK_API_KEY 和 ANTHROPIC_API_KEY
 ```
 
-加载环境变量：
+**Windows（PowerShell）：**
 
-```bash
-set -a && source .env && set +a
+```powershell
+git clone https://github.com/reinhardt6678-sudo/Moltbook_MadTed.git
+cd Moltbook_MadTed
+
+python -m venv .venv
+.\.venv\Scripts\Activate.ps1
+pip install -r requirements.txt
+
+Copy-Item .env.example .env
+notepad .env    # 填入两个 key
 ```
+
+> 如果 `Activate.ps1` 报「禁止运行脚本」，先在当前窗口放开一次（只影响这个窗口）：
+> ```powershell
+> Set-ExecutionPolicy -Scope Process -ExecutionPolicy Bypass
+> ```
+
+**不需要手动加载环境变量。** `heartbeat.py`、`daily_report.py`、`preflight.py`
+启动时会自己读仓库根目录的 `.env`（`scripts/config.py`）。已经存在的环境变量
+优先级更高，所以想临时覆盖某个 key，直接在命令行设环境变量就行。
 
 先跑测试确认环境没问题（这些测试不需要任何 key）：
 
@@ -199,30 +218,34 @@ Moltbook 有 moderator bot（Clawd Clawderberg）专门清垃圾封号。
 
 （cron 用的是服务器本地时区，注意换算。）
 
-⚠️ **cron 的两个经典坑**，装完一定要验：
+⚠️ **cron 的经典坑：`logs/` 不存在则整条命令失败**，而且失败得很安静——
+重定向在命令执行前就报错了，你连日志都看不到。上面的 `mkdir -p logs` 就是干这个的
+（`scripts/preflight.py` 也会顺手建好）。
 
-1. **`logs/` 不存在则整条命令失败**，而且失败得很安静——重定向在命令执行前就报错了。
-   上面的 `mkdir -p logs` 就是干这个的（`scripts/preflight.py` 也会顺手建好）。
-2. **cron 不读你的 `.env`，也不读 `.bashrc`。** 交互式 shell 里能跑不代表 cron 里能跑。
-   两个办法二选一：
+密钥不用操心：cron 不读你的 `.bashrc`，但脚本会自己读仓库根目录的 `.env`，
+所以不需要在 crontab 里 source 任何东西。
 
-   ```cron
-   # 办法 A：在命令里显式 source
-   0 */4 * * * cd /path/to/Moltbook_MadTed && mkdir -p logs && set -a && . ./.env && set +a && .venv/bin/python scripts/heartbeat.py --max-new 3 >> logs/heartbeat.log 2>&1
-   ```
-
-   办法 B：直接把两个 key 写在 crontab 文件顶部（记得 `chmod 600` 你的 crontab）。
-
-装好后别等 4 小时，先在**模拟 cron 的干净环境**里跑一次自检：
+装好后别等 4 小时，先在**模拟 cron 的干净环境**里跑一次自检——验的是 Python 路径、
+依赖和目录权限在没有你 shell 配置的情况下还成不成立：
 
 ```bash
 env -i HOME="$HOME" PATH=/usr/bin:/bin sh -c \
   'cd /path/to/Moltbook_MadTed && .venv/bin/python scripts/preflight.py'
 ```
 
-这一步验的是 Python 路径、依赖和目录权限在没有你 shell 配置的情况下还成不成立。
-注意自检本身会替你读 `.env`，而 `heartbeat.py` 不会——所以只要看到
-「密钥进环境变量」这条 WARN，就说明 cron 里必须补上面办法 A 或 B，否则照样拿不到 key。
+**Windows 用任务计划程序（Task Scheduler）代替 cron：**
+
+```powershell
+# 每 4 小时跑一次 heartbeat
+$action  = New-ScheduledTaskAction -Execute "C:\path\to\Moltbook_MadTed\.venv\Scripts\python.exe" `
+           -Argument "scripts\heartbeat.py --max-new 3" `
+           -WorkingDirectory "C:\path\to\Moltbook_MadTed"
+$trigger = New-ScheduledTaskTrigger -Once -At (Get-Date) `
+           -RepetitionInterval (New-TimeSpan -Hours 4)
+Register-ScheduledTask -TaskName "MadTed heartbeat" -Action $action -Trigger $trigger
+```
+
+`-WorkingDirectory` 必须指对，脚本靠它找到 `.env` 和 `memory/`。
 
 ---
 
@@ -260,6 +283,7 @@ print('利刃/钝刀/禁用', m.angle_preference())
 | 文件 | 作用 |
 |---|---|
 | `scripts/preflight.py` | 上线前自检。密钥、目录、端点、字段对齐一次查完。**部署卡住先跑它。** |
+| `scripts/config.py` | 读 `.env` 进环境变量。所有入口脚本共用，Windows / cron 都不用手动 source。 |
 | `scripts/moltbook_client.py` | Moltbook API 封装。限流、重试、冷却都在这里。**改端点只改这个文件。** |
 | `scripts/radar.py` | 杠点雷达。纯逻辑，给帖子打分排序，LLM 只看排名靠前的，省钱。 |
 | `scripts/memory.py` | 记忆与学习。杠力值、冷场归因、免战名单、角度统计。 |

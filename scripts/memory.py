@@ -52,6 +52,22 @@ ANGLES = {
 # 单招使用占比超过这个阈值就禁用一周（人设 §10.5）
 ANGLE_BAN_THRESHOLD = 0.35
 
+# 冷场归因（人设 §8.2）。前四类是原有的，第五类是新增的：
+#
+# 「语言不通」不是 MadTed 的失误，是**无效样本**——对方没回应不是因为角度钝、
+# 话题冷或姿态太冲，而是他压根读不懂。这种冷场如果按前四类去归因，会把
+# 一个好角度记进「钝刀」、把一个正常对手记进「免战名单」，越学越偏。
+# 所以命中这一类的战绩不参与任何学习，只留档。
+COLD_CAUSE_LANGUAGE = "语言不通"
+COLD_CAUSES = ("对象型", "话题型", "角度型", "姿态型", COLD_CAUSE_LANGUAGE)
+
+# 结构信号（radar.py 的 L0 层）→ 是否引发了互动。
+# 和 radar-keywords.json 的词表学习不同，这里学到的东西**跨语言可迁移**：
+# "裸数据帖容易杠出多轮"这条经验在中英文 feed 上同样成立，
+# 而"'其实吧'这个词是好钩子"换成英文 feed 就一文不值。
+SIGNAL_MIN_SAMPLES = 6
+
+
 
 def _empty_memory() -> dict[str, Any]:
     return {
@@ -65,6 +81,7 @@ def _empty_memory() -> dict[str, Any]:
             "worthy_rivals": [],
         },
         "angle_stats": {},
+        "signal_stats": {},
         "restraint_log": [],
         "angle_ban": {"banned": None, "until": None},
         "keyword_stats": {},
@@ -111,8 +128,16 @@ class Memory:
         outcome: str,
         reactions: int = 0,
         note: str = "",
+        cold_cause: str = "",
+        signals: dict[str, Any] | None = None,
     ) -> int:
-        """记一条战绩，返回本次的分数变化。"""
+        """记一条战绩，返回本次的分数变化。
+
+        cold_cause 是冷场归因（§8.2）。命中 COLD_CAUSE_LANGUAGE 的战绩只留档、
+        不参与学习——回复发错语言导致的沉默，怪不到角度和对手头上。
+
+        signals 是开杠时 radar 记录的结构信号，用于跨语言的选题学习。
+        """
         delta = SCORE_TABLE.get(outcome, 0)
         self.data["battles"].append(
             {
@@ -126,10 +151,23 @@ class Memory:
                 "reactions": reactions,
                 "score_delta": delta,
                 "note": note,
+                "cold_cause": cold_cause,
+                "signals": signals or {},
             }
         )
         self._apply_score(delta)
-        self._update_angle_stats(angle_used, effective=rounds >= 2 or outcome == "对方改口")
+
+        engaged = rounds >= 2 or outcome == "对方改口"
+
+        # 无效样本：对方看不懂，说明不了角度好坏，也说明不了这个对手好不好杠。
+        # 记进战绩留档，但不喂给任何学习机制。
+        if cold_cause == COLD_CAUSE_LANGUAGE:
+            log_note = "冷场归因为语言不通，本条不参与角度/对手/信号学习"
+            self.data["battles"][-1]["note"] = f"{note}（{log_note}）" if note else log_note
+            return delta
+
+        self._update_angle_stats(angle_used, effective=engaged)
+        self._update_signal_stats(signals or {}, engaged=engaged)
         self._learn_from_outcome(opponent, topic_type, angle_used, outcome, rounds)
         return delta
 
@@ -153,6 +191,37 @@ class Memory:
             stats["effective"] += 1
         self._refresh_sharp_blunt()
         self._maybe_ban_overused_angle()
+
+    # ---------- 结构信号学习（跨语言可迁移） ----------
+
+    def _update_signal_stats(self, signals: dict[str, Any], *, engaged: bool) -> None:
+        """记录『带这些结构特征的帖子，杠出互动了没有』。
+
+        radar 在打分时已经把特征算好放进 signals["features"]，这里只做累加，
+        不重复实现判定逻辑。
+        """
+        stats = self.data.setdefault("signal_stats", {})
+        for feature in signals.get("features", []):
+            entry = stats.setdefault(feature, {"seen": 0, "engaged": 0})
+            entry["seen"] += 1
+            if engaged:
+                entry["engaged"] += 1
+
+    def signal_bias(self) -> dict[str, float]:
+        """把积累的战绩换算成结构信号的权重系数，喂回 radar 选题。
+
+        基准线是 50% 的互动率：高于基准的特征加权，低于的降权，
+        样本不足的一律按 1.0（不表态）。系数夹在 [0.6, 1.4]，
+        避免早期几条战绩就把选题带偏。
+        """
+        bias: dict[str, float] = {}
+        for feature, entry in self.data.get("signal_stats", {}).items():
+            seen = entry.get("seen", 0)
+            if seen < SIGNAL_MIN_SAMPLES:
+                continue
+            rate = entry.get("engaged", 0) / seen
+            bias[feature] = round(min(max(0.6 + rate * 0.8, 0.6), 1.4), 3)
+        return bias
 
     def _refresh_sharp_blunt(self) -> None:
         """有效率高的进『利刃』，低的进『钝刀』（人设 §8.2）。"""

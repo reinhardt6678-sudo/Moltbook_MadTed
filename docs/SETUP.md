@@ -201,8 +201,13 @@ python scripts/heartbeat.py --max-new 3
 想更强用 `claude-opus-5`。也可以在 `.env` 里设 `MADTED_MODEL` 长期生效。
 各模型价差和省钱开关见下面的「成本估算」。
 
-**关于 `--max-deliberate`**（默认 4）：本轮最多问几次 Claude。雷达可能筛出 10 条
-候选，判定「划走」的那几次同样花钱——这个上限就是用来砍最坏情况的。
+**关于 `--max-deliberate`**（默认 4）：本轮最多问几次 L2 深度独白。加了 L1 粗筛之后
+这个上限的意义变了——以前它是纯省钱，现在是「L2 只处理粗筛后的前几名」，
+省下来的那几次不会花在垃圾候选上。
+
+**关于 `--no-triage`**：跳过 L1 语义粗筛，只用 L0 结构分排序。省那约 $0.02，
+但选题精度会下降——L0 看得懂帖子长什么样，看不懂他说的话站不站得住。
+L1 挂了（API 报错、解析失败）会自动退化成这个模式，不会中断整轮。
 
 ---
 
@@ -297,7 +302,8 @@ python scripts/show_state.py --threads   # 只看进行中的对线
 | `scripts/preflight.py` | 上线前自检。密钥、目录、端点、字段对齐一次查完。**部署卡住先跑它。** |
 | `scripts/config.py` | 读 `.env` 进环境变量。所有入口脚本共用，Windows / cron 都不用手动 source。 |
 | `scripts/moltbook_client.py` | Moltbook API 封装。限流、重试、冷却都在这里。**改端点只改这个文件。** |
-| `scripts/radar.py` | 杠点雷达。纯逻辑，给帖子打分排序，LLM 只看排名靠前的，省钱。 |
+| `scripts/radar.py` | 杠点雷达 **L0**。纯逻辑结构层：emoji 密度、有无出处、赞评比、代码块。红线否决在这一层。 |
+| `scripts/triage.py` | 杠点雷达 **L1**。Haiku 批量语义粗筛，判断论证结构缺陷。`--no-triage` 可关。 |
 | `scripts/memory.py` | 记忆与学习。杠力值、冷场归因、免战名单、角度统计。 |
 | `scripts/brain.py` | 调 Claude 生成内心独白和回复。人设文档在这里被当 system prompt 用。 |
 | `scripts/heartbeat.py` | 主流程。先跟进老讨论串，再开新杠。 |
@@ -305,7 +311,7 @@ python scripts/show_state.py --threads   # 只看进行中的对线
 | `scripts/show_monologue.py` | 按人设格式打印当天内心独白。**想知道它为什么挑这条帖子就看这个。** |
 | `scripts/show_state.py` | 杠力值、进行中的对线、学到的东西。**Windows 上别直接 `type` json，会乱码。** |
 | `personas/contrarian-agent.md` | **人设文档 = system prompt。想改 MadTed 的性格改这里，不用碰代码。** |
-| `memory/radar-keywords.json` | 雷达词表，可手工加词，也会自更新。 |
+| `memory/radar-keywords.json` | 雷达词表。**只是 L0 的辅助信号**，没有否决权；可手工加词，也会自更新。 |
 
 ---
 
@@ -334,8 +340,12 @@ python scripts/show_state.py --threads   # 只看进行中的对线
    注意 Haiku 抬杠质量会下降——它挖隐藏假设的本事不如 Sonnet。建议先用 Sonnet
    跑几天，觉得质量有富余再降。
 
-2. **`--max-deliberate`**（默认 4）——雷达可能筛出 10 条候选，判定"划走"的那几次
+2. **`--max-deliberate`**（默认 4）——L2 深度独白的次数上限，判定"划走"的那几次
    也是要花钱的。这个上限直接砍掉最坏情况。调到 2 能再省一半。
+
+   L1 粗筛（`triage.py`）本身很便宜：Haiku 4.5 是 $1/$5，一轮 60 条帖子约
+   9K 输入 + 2.4K 输出 ≈ **$0.02**，一天 6 轮约 $0.13。相比它带来的选题精度，
+   基本不值得关。真要省就用 `--no-triage`。
 
 3. **`--effort low`**——主要压缩 thinking 的长度，也就是压最贵的输出侧。
 

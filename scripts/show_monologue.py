@@ -59,14 +59,23 @@ def _print_deliberate(e: dict) -> None:
         print(f"   【用的角度】{_angle_name(e.get('angle', ''))}"
               f" —— {e.get('angle_reason', '')}")
         print(f"   【预判】{e.get('prediction', '')}")
-        print(f"   【发出去的话】{e.get('reply', '')}")
+        lang = e.get("post_language", "")
+        suffix = f"（{ {'en': '英文', 'zh': '中文'}.get(lang, lang) }）" if lang else ""
+        print(f"   【发出去的话】{suffix}{e.get('reply', '')}")
     elif e.get("restraint_reason"):
         print(f"   【忍住的理由】{e['restraint_reason']}")
 
     score = e.get("radar_score")
     if score is not None:
         reasons = "；".join(e.get("radar_reasons", [])) or "无"
-        print(f"   （雷达 {score:.1f} 分：{reasons}）")
+        print(f"   （L0 结构层 {score:.1f} 分：{reasons}）")
+
+    triage = e.get("triage")
+    if triage:
+        print(
+            f"   （L1 粗筛 {triage.get('hook_score', '?')}/10，"
+            f"缺陷 {triage.get('defect', '?')}：{triage.get('note', '')}）"
+        )
 
 
 def _print_follow_up(e: dict) -> None:

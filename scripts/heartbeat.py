@@ -5,10 +5,16 @@
   2. 剩余额度再去 feed 里开新杠
   3. 更新记忆、写独白日志
 
+选题走三级漏斗，一级比一级贵：
+  L0  radar.py   结构信号打分   免费     60 条 → 约 12 条
+  L1  triage.py  Haiku 语义粗筛 约 $0.02  12 条 → 排序 + 剔红线
+  L2  brain.py   Sonnet 深度独白 最贵     最多 max-deliberate 条
+
 用法：
     python scripts/heartbeat.py                # 正常跑
     python scripts/heartbeat.py --dry-run      # 不真的发帖，只打印
     python scripts/heartbeat.py --max-new 2    # 限制本轮最多开 2 个新杠
+    python scripts/heartbeat.py --no-triage    # 跳过 L1，只用 L0 排序
 """
 
 from __future__ import annotations
@@ -24,9 +30,10 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 from brain import Brain, FollowUp, Monologue  # noqa: E402
 from config import load_dotenv  # noqa: E402
-from memory import Memory  # noqa: E402
+from memory import COLD_CAUSE_LANGUAGE, Memory  # noqa: E402
 from moltbook_client import MoltbookClient, MoltbookError  # noqa: E402
 import radar  # noqa: E402
+from triage import Triage, split_redlines  # noqa: E402
 
 log = logging.getLogger("madted")
 
@@ -137,6 +144,7 @@ def follow_up_threads(
             blunt=blunt,
             banned=banned,
             opponent_profile=mem.opponent_profile(thread["opponent"]),
+            target_language=thread.get("post_language", ""),
         )
         if decision is None:
             continue
@@ -166,6 +174,7 @@ def follow_up_threads(
                 continue
 
         thread["turns"].append({"role": "self", "text": decision.reply})
+        thread["reply_language"] = radar.detect_language(decision.reply)
         thread["rounds"] += 1
         if decision.angle != "none":
             thread.setdefault("used_angles", []).append(decision.angle)
@@ -178,6 +187,26 @@ def follow_up_threads(
     return handled
 
 
+def _cold_cause(thread: dict) -> str:
+    """冷场归因（人设 §8.2）：先排除『对方根本读不懂』这种无效样本。
+
+    如果我们用中文回了一条英文帖，没人理是必然的——这既说明不了角度钝，
+    也说明不了这个对手不接招。不做这层排除，一次语言事故就会把一个好角度
+    记进「钝刀」，把一个正常对手记进「免战名单」。
+    """
+    post_lang = thread.get("post_language", "")
+    reply_lang = thread.get("reply_language", "")
+    if post_lang and reply_lang and post_lang != reply_lang:
+        log.warning(
+            "讨论串 %s：回复语言(%s)和原帖语言(%s)不一致，冷场判为无效样本",
+            thread.get("title", "")[:20],
+            reply_lang,
+            post_lang,
+        )
+        return COLD_CAUSE_LANGUAGE
+    return ""
+
+
 def _close_thread(mem: Memory, thread: dict, post_id: str, *, outcome: str, note: str) -> None:
     thread["closed"] = True
     mem.record_battle(
@@ -188,6 +217,8 @@ def _close_thread(mem: Memory, thread: dict, post_id: str, *, outcome: str, note
         rounds=thread["rounds"],
         outcome=outcome,
         note=note,
+        cold_cause=_cold_cause(thread) if outcome == "冷场" else "",
+        signals=thread.get("signals", {}),
     )
     log.info("讨论串 %s 收尾：%s（%d 轮）", post_id, outcome, thread["rounds"])
 
@@ -216,11 +247,15 @@ def open_new_battles(
     max_new: int,
     max_deliberate: int,
     dry_run: bool,
+    triage: Triage | None = None,
 ) -> tuple[int, list[str]]:
     """浏览 feed，挑杠点最多的帖子出手。返回 (出手数, 放弃理由列表)。
 
-    max_deliberate 是本轮最多问几次 Claude 的硬上限——雷达可能筛出 10 条候选，
-    如果前几条都判定划走，不设上限就会把 10 条全问一遍，钱花在没出手的判断上。
+    三级漏斗：L0 结构打分 → L1 语义粗筛 → L2 深度独白。
+
+    max_deliberate 是本轮最多问几次 L2 的硬上限。加了 L1 之后这个上限的
+    意义变了：以前它是"省钱"，现在它是"L2 只处理粗筛后的前几名"——
+    钱省得更多，而且省下来的那几次没花在垃圾候选上。
     """
     keywords = radar.load_keywords()
     sharp, blunt, banned = mem.angle_preference()
@@ -234,29 +269,57 @@ def open_new_battles(
     # 已经参与过的帖子不再重复开杠
     posts = [p for p in posts if str(p.get("id")) not in threads]
 
+    # ---- L0：结构层 ----
     accepted, rejected = radar.rank_feed(
         posts,
         keywords,
         truce_list=mem.truce_list,
         low_yield_topics=mem.low_yield_topics,
+        signal_bias=mem.signal_bias(),
     )
-    log.info("扫描 %d 条帖子 → %d 条候选，%d 条直接划走", len(posts), len(accepted), len(rejected))
+    log.info("L0 扫描 %d 条 → %d 条候选，%d 条划走", len(posts), len(accepted), len(rejected))
 
-    restraint_reasons = [
-        c.veto_reason or "杠点太弱" for c in rejected if c.veto_reason or c.score < 4.0
-    ]
+    # 只有『有杠点但主动放弃』才算忍住了（§10.6）。以前把每条低分流水帖
+    # 都算进来，日报里那个数字等于 feed 长度，纯属自我感动。
+    restraint = radar.restraint_reasons(rejected)
+
+    # ---- L1：语义粗筛 ----
+    if triage is not None and accepted:
+        scored = triage.rank(accepted)
+        passable, triage_restraint = split_redlines(scored)
+        restraint.extend(triage_restraint)
+        log.info(
+            "L1 粗筛 %d 条 → %d 条可上，%d 条剔除（红线/杠点太弱）",
+            len(scored),
+            len(passable),
+            len(triage_restraint),
+        )
+        queue = [(s.candidate, s.verdict) for s in passable]
+    else:
+        queue = [(c, None) for c in accepted]
+
     skipped_summaries: list[str] = []
     engaged = 0
-
     deliberated = 0
-    for cand in accepted:
+
+    # ---- L2：深度独白 ----
+    for cand, verdict in queue:
         if engaged >= max_new:
             break
         if deliberated >= max_deliberate:
-            log.info("已问满 %d 次 Claude，本轮不再深挖（省钱上限）", max_deliberate)
+            log.info("已问满 %d 次 L2，本轮不再深挖", max_deliberate)
             break
         deliberated += 1
 
+        hint = ""
+        if verdict is not None:
+            hint = (
+                f"杠点密度 {verdict.hook_score}/10；"
+                f"主要缺陷 {verdict.defect}；建议角度 {verdict.angle}。"
+                f"粗筛备注：{verdict.note}"
+            )
+
+        post_language = cand.signals.get("language", "")
         monologue: Monologue | None = brain.deliberate(
             _format_post(cand.post),
             skipped_summaries,
@@ -264,6 +327,8 @@ def open_new_battles(
             blunt=blunt,
             banned=banned,
             opponent_profile=mem.opponent_profile(cand.author) or None,
+            target_language=post_language,
+            triage_hint=hint,
         )
         if monologue is None:
             continue
@@ -276,13 +341,16 @@ def open_new_battles(
                 "author": cand.author,
                 "radar_score": cand.score,
                 "radar_reasons": cand.reasons,
+                "radar_signals": cand.signals,
+                "post_language": post_language,
+                "triage": verdict.model_dump() if verdict is not None else None,
                 **monologue.model_dump(),
             }
         )
 
         if monologue.verdict != "出手":
             skipped_summaries.append(f"{cand.summary()} → {monologue.why_this_one}")
-            restraint_reasons.append(monologue.restraint_reason or "杠点太弱")
+            restraint.append(monologue.restraint_reason or "杠点太弱")
             continue
 
         if dry_run:
@@ -294,22 +362,38 @@ def open_new_battles(
                 log.error("评论发送失败：%s", exc)
                 continue
 
+        # 回复实际用的语言按发出去的文本判定，不信模型自报的 reply_language——
+        # 冷场归因要靠它排除无效样本，自报可能和实际不符。
+        actual_reply_language = radar.detect_language(monologue.reply)
+        if post_language and actual_reply_language != post_language:
+            log.warning(
+                "回复语言(%s)和原帖(%s)不一致：%s",
+                actual_reply_language,
+                post_language,
+                monologue.reply[:60],
+            )
+
         threads[cand.post_id] = {
             "title": cand.title,
             "opponent": cand.author,
-            "topic_type": ",".join(cand.hits.keys()) or "未分类",
+            "topic_type": verdict.defect if verdict is not None else (
+                ",".join(cand.hits.keys()) or "未分类"
+            ),
             "rounds": 1,
             "used_angles": [monologue.angle],
             "turns": [{"role": "self", "text": monologue.reply}],
             "seen_reply_ids": [],
             "idle_cycles": 0,
             "opened_at": datetime.now(timezone.utc).isoformat(),
+            "post_language": post_language,
+            "reply_language": actual_reply_language,
+            "signals": cand.signals,
             "closed": False,
         }
         engaged += 1
-        log.info("已对《%s》出手（角度 %s）", cand.title[:30], monologue.angle)
+        log.info("已对《%s》出手（角度 %s / %s）", cand.title[:30], monologue.angle, post_language)
 
-    return engaged, restraint_reasons
+    return engaged, restraint
 
 
 # ---------- 主流程 ----------
@@ -322,9 +406,13 @@ def run_cycle(
     effort: str = "medium",
     model: str | None = None,
     max_deliberate: int = 4,
+    use_triage: bool = True,
+    triage_model: str | None = None,
 ) -> None:
     client = MoltbookClient.from_env(dry_run=dry_run)
     brain = Brain(effort=effort, model=model)
+    # L1 和 L2 共用一个 anthropic 客户端，省一次连接初始化
+    triage = Triage(client=brain.client, model=triage_model) if use_triage else None
     mem = Memory()
     threads = _load_threads()
 
@@ -344,6 +432,7 @@ def run_cycle(
         max_new=max_new,
         max_deliberate=max_deliberate,
         dry_run=dry_run,
+        triage=triage,
     )
     log.info("阶段2：开了 %d 个新杠，忍住了 %d 条", engaged, len(restraint))
 
@@ -373,7 +462,17 @@ def main() -> None:
         "--max-deliberate",
         type=int,
         default=4,
-        help="本轮最多问几次 Claude（含判定划走的）。省钱的主要开关",
+        help="本轮最多问几次 L2 深度独白（含判定划走的）。省钱的主要开关",
+    )
+    parser.add_argument(
+        "--no-triage",
+        action="store_true",
+        help="跳过 L1 语义粗筛，只用 L0 结构分排序（省那 ~$0.02，但选题精度下降）",
+    )
+    parser.add_argument(
+        "--triage-model",
+        default=None,
+        help="L1 粗筛用的模型（默认 claude-haiku-4-5，也可设 MADTED_TRIAGE_MODEL 环境变量）",
     )
     parser.add_argument("--verbose", action="store_true")
     args = parser.parse_args()
@@ -390,6 +489,8 @@ def main() -> None:
         effort=args.effort,
         model=args.model,
         max_deliberate=args.max_deliberate,
+        use_triage=not args.no_triage,
+        triage_model=args.triage_model,
     )
 
 

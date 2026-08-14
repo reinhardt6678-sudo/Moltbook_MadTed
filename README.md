@@ -72,7 +72,7 @@ python scripts/heartbeat.py --dry-run --max-new 2   # 空跑，不真的发帖
 | 周末自杠日 | 翻出自己过去的观点反过来杠自己，标准不放水 |
 | 角度热力图 | 某招使用占比超 35% 就禁用一周，逼出新花样 |
 | "忍住了"计数器 | 有杠点但主动放弃的次数——证明它是有选择地杠 |
-| 杠点雷达 | 高危词表自动预警，词表本身也会自更新 |
+| 杠点雷达 | 三级漏斗：结构信号 → 语义粗筛 → 深度独白，选题规则不挑语言 |
 | 反噬记录 | 被杠赢时把对方的招偷学进工具箱，注明出处 |
 | 月度回顾 | 公开列自己本月错误清单 |
 
@@ -106,21 +106,22 @@ Moltbook 的 agent 靠平台 **Heartbeat 机制**驱动，约每 4 小时唤醒�
 | `scripts/preflight.py` | 上线前自检。密钥、目录权限、端点路径、feed 字段对齐一次查完。**部署卡住先跑它。** |
 | `scripts/config.py` | 读 `.env` 进环境变量。所有入口脚本共用，Windows / cron 都不用手动 source。 |
 | `scripts/moltbook_client.py` | Moltbook API 封装。限流、退避重试、发帖/评论冷却。**改端点只改这个文件。** |
-| `scripts/radar.py` | 杠点雷达。纯逻辑给帖子打分排序，LLM 只看排名靠前的，省 token。 |
-| `scripts/memory.py` | 记忆与学习。杠力值、冷场四类归因、免战名单、角度统计、禁用超频招式。 |
+| `scripts/radar.py` | 杠点雷达 **L0 结构层**。纯逻辑，靠 emoji 密度/有无出处/赞评比这类语言无关信号打分和否决。 |
+| `scripts/triage.py` | 杠点雷达 **L1 语义层**。用 Haiku 批量判断论证结构有没有缺陷，约 $0.02 一轮。 |
+| `scripts/memory.py` | 记忆与学习。杠力值、冷场五类归因、免战名单、角度统计、跨语言的结构信号权重。 |
 | `scripts/brain.py` | 调 Claude 生成内心独白与回复。人设文档在这里当 system prompt（带 prompt caching）。 |
 | `scripts/heartbeat.py` | 主流程：先跟进老讨论串 → 再开新杠 → 更新记忆。 |
 | `scripts/daily_report.py` | 每日战报。`--no-llm` 可只看原始统计。 |
 | `scripts/show_monologue.py` | 按人设格式打印当天内心独白。**想知道它为什么挑这条帖子就看这个。** |
 | `scripts/show_state.py` | 杠力值、进行中的对线、学到的东西。**Windows 上别直接 `type` json，会乱码。** |
-| `tests/` | 26 个单元测试，纯逻辑不需要 key。 |
+| `tests/` | 106 个单元测试，中英文样本都覆盖，纯逻辑不需要 key。 |
 
 ```
 personas/contrarian-agent.md   # 人设 = system prompt
 scripts/                       # 可运行实现
 tests/                         # 单元测试
 docs/SETUP.md                  # 接入指南
-memory/radar-keywords.json     # 雷达词表（可手工加词，也会自更新）
+memory/radar-keywords.json     # 雷达词表（L0 的辅助信号，可手工加词）
 memory/madted-memory.json      # （运行时生成）战绩、名单、统计
 reports/monologue/*.jsonl      # （运行时生成）每日完整心理活动
 reports/daily/*.md             # （运行时生成）每日战报

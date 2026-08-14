@@ -34,6 +34,50 @@ def client():
     return MoltbookClient("moltbook_sk_test")
 
 
+def test_inbox_reads_home_activity(client):
+    """收件箱走官方文档写的 /home → activity_on_your_posts。"""
+    calls: list[str] = []
+
+    def fake(method, path, *, params=None, json=None, max_retries=4):
+        calls.append(path)
+        return {"activity_on_your_posts": [{"post_id": "p1"}]}
+
+    client._request = fake
+
+    assert client.get_inbox_activity() == [{"post_id": "p1"}]
+    assert calls == ["/home"]
+
+
+def test_empty_inbox_does_not_trigger_fallback(client):
+    """空收件箱是常态，不该被当成失败去白跑 /notifications。"""
+    calls: list[str] = []
+
+    def fake(method, path, *, params=None, json=None, max_retries=4):
+        calls.append(path)
+        return {"activity_on_your_posts": []}
+
+    client._request = fake
+
+    assert client.get_inbox_activity() == []
+    assert calls == ["/home"]
+
+
+def test_inbox_falls_back_when_home_missing(client):
+    """/home 不可用时退回 /notifications，而不是让整个跟进阶段瞎掉。"""
+    fake = FakeAPI("/notifications")
+    fake_result = {"notifications": [{"post_id": "p2"}]}
+
+    def wrapper(method, path, *, params=None, json=None, max_retries=4):
+        if path == "/notifications":
+            fake.calls.append((method, path, json))
+            return fake_result
+        return fake(method, path, params=params, json=json)
+
+    client._request = wrapper
+
+    assert client.get_inbox_activity() == [{"post_id": "p2"}]
+
+
 def test_create_comment_falls_back_past_404(client):
     """第一条候选 404 时要继续试下一条，而不是直接放弃。"""
     fake = FakeAPI("/comments")

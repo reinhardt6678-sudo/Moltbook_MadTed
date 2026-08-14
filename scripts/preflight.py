@@ -414,8 +414,31 @@ def check_moltbook(r: Report) -> None:
     else:
         r.ok("feed 字段对齐", "radar 需要的字段都在")
 
+    check_inbox(r, client)
 
-def main() -> int:
+
+def check_inbox(r: Report, client) -> None:
+    """收件箱端点。
+
+    单列一项是有原因的：这条链路断了不会报错，只会安静地"看不见任何回复"，
+    然后每个讨论串熬满 3 个周期被判冷场——日报上是一串冷场，
+    网页上却全是别人的回复。跟进阶段现在直接轮询评论区兜底，
+    所以这里挂了只是慢一点，但值得说一声。
+    """
+    from moltbook_client import MoltbookError
+
+    try:
+        activity = client.get_inbox_activity()
+    except MoltbookError as exc:
+        r.warn(
+            "Moltbook 收件箱",
+            f"取不到（{exc}）",
+            "不致命：跟进阶段会直接轮询各讨论串的评论区。\n"
+            "想恢复这条快路，对照官方文档改 moltbook_client.py 的 get_inbox_activity()。",
+        )
+        return
+
+    r.ok("Moltbook 收件箱", f"{len(activity)} 条待处理活动")
     parser = argparse.ArgumentParser(description="MadTed 上线前自检")
     parser.add_argument(
         "--skip-api", action="store_true", help="跳过 Anthropic / Moltbook 的网络检查"

@@ -233,14 +233,59 @@ class MoltbookClient:
         )
         return _unwrap_list(data, "comments", "replies")
 
-    def get_notifications(self, *, unread_only: bool = True) -> list[dict]:
-        """拉取通知——这是发现『对方回复了我』的主要途径。"""
-        params = {"unread": "true"} if unread_only else {}
-        data = self._request("GET", "/notifications", params=params)
+    def get_home(self) -> dict:
+        """首页看板。官方文档（HEARTBEAT.md）里发现『有人回复你』的正门：
+        返回体里的 activity_on_your_posts 就是收件箱。
+        """
+        return self._request("GET", "/home") or {}
+
+    def get_inbox_activity(self) -> list[dict]:
+        """收件箱里的活动条目——发现『对方回复了我』的**辅助**途径，不是唯一途径。
+
+        先走官方文档写明的 /home，再退回 /notifications 系列。之前这里只硬编码了
+        一个 /notifications——而官方文档根本没有这个端点，它一 404，
+        整个跟进阶段就直接 return 0，一条回复都看不见。
+
+        另外也不再只拉未读：未读状态是主人在网页端点一下就会变的东西，
+        拿它当发现回复的开关，等于让"主人看过没有"决定 agent 看不看得见回复。
+        真正的判据是 get_replies() 里有没有新 id（见 heartbeat.py）。
+        """
+        try:
+            home = self.get_home()
+        except MoltbookError as exc:
+            log.info("/home 不可用（%s），改试 /notifications 系列", exc)
+        else:
+            # 认"这个键在不在"，不认"列表空不空"——空收件箱是常态，
+            # 拿空列表当失败会让每个周期都白跑一轮回退请求。
+            for key in ("activity_on_your_posts", "activity", "notifications"):
+                value = home.get(key)
+                if isinstance(value, list):
+                    return value
+            log.info("/home 里没有 activity_on_your_posts 字段，改试 /notifications 系列")
+
+        data = self._try_paths(
+            "GET",
+            [("/notifications", None), ("/agents/notifications", None)],
+            cache_key="get_notifications",
+        )
         return _unwrap_list(data, "notifications")
 
-    def mark_notification_read(self, notification_id: str) -> None:
-        self._request("POST", f"/notifications/{notification_id}/read")
+    def mark_post_read(self, post_id: str) -> None:
+        """把某个帖子下的活动标记为已读（官方文档写的是按帖子标，不是按通知 id）。
+
+        标记失败无所谓：读回复靠 get_replies()，这里只是别让主人的未读数一直涨。
+        """
+        try:
+            self._try_paths(
+                "POST",
+                [
+                    (f"/notifications/read-by-post/{post_id}", None),
+                    (f"/notifications/read", {"post_id": post_id}),
+                ],
+                cache_key="mark_read",
+            )
+        except MoltbookError as exc:
+            log.info("标记 %s 已读失败（不影响跟进）：%s", post_id, exc)
 
     def get_agent_status(self) -> dict:
         """心跳/状态检查，也用于确认 agent 是否已被认领。"""
@@ -279,6 +324,72 @@ class MoltbookClient:
 
     def can_post_now(self) -> bool:
         return self._throttle.remaining_cooldown("post", RATE_LIMITS["post_cooldown_sec"]) == 0
+
+
+# ---------- 字段提取 ----------
+#
+# 同一个东西不同端点叫法不一样（评论 id 有 id / comment_id / _id 三种写法，
+# 作者有时是字符串有时是对象）。以前这些提取散在调用处、每处只认一两个写法，
+# 猜错就静默变成空字符串——空字符串会一路穿过去当成"没有回复"，
+# 最后被记成冷场。集中在这里，认全所有见过的写法。
+
+
+def _first_str(source: dict, keys: tuple[str, ...]) -> str:
+    for key in keys:
+        value = source.get(key)
+        if isinstance(value, (str, int)) and str(value).strip():
+            return str(value)
+    return ""
+
+
+def comment_id(comment: dict) -> str:
+    return _first_str(comment, ("id", "comment_id", "commentId", "_id"))
+
+
+def author_name(obj: dict) -> str:
+    """取评论/帖子的作者名。作者可能是嵌套对象，也可能直接是字符串。"""
+    for key in ("author", "agent", "user", "created_by"):
+        value = obj.get(key)
+        if isinstance(value, dict):
+            name = _first_str(value, ("name", "username", "handle", "agent_name", "id"))
+            if name:
+                return name
+        elif isinstance(value, str) and value.strip():
+            return value
+    return _first_str(obj, ("author_name", "username", "agent_name"))
+
+
+def parent_comment_id(comment: dict) -> str:
+    """这条评论回的是哪条评论。顶层评论没有父级，返回空字符串。"""
+    for key in ("parent_id", "parentId", "parent_comment_id", "in_reply_to", "reply_to"):
+        value = comment.get(key)
+        if isinstance(value, dict):
+            nested = _first_str(value, ("id", "comment_id", "_id"))
+            if nested:
+                return nested
+        elif isinstance(value, (str, int)) and str(value).strip():
+            return str(value)
+    parent = comment.get("parent")
+    if isinstance(parent, dict):
+        return _first_str(parent, ("id", "comment_id", "_id"))
+    return ""
+
+
+def notification_post_id(notification: dict) -> str:
+    """通知指向哪个帖子。取不到就返回空——调用方应当忽略，不要当成 '所有帖子'。"""
+    direct = _first_str(
+        notification,
+        ("post_id", "postId", "target_id", "targetId", "subject_id", "thread_id"),
+    )
+    if direct:
+        return direct
+    for key in ("post", "target", "subject", "data", "payload"):
+        nested = notification.get(key)
+        if isinstance(nested, dict):
+            found = _first_str(nested, ("post_id", "postId", "id", "_id"))
+            if found:
+                return found
+    return ""
 
 
 def _unwrap_list(data: Any, *keys: str) -> list[dict]:

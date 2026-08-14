@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import sys
 from pathlib import Path
 
@@ -247,3 +248,60 @@ def test_old_memory_files_without_signal_stats_still_load(tmp_path):
     mem = Memory(path)
     assert mem.data["signal_stats"] == {}
     assert mem.signal_bias() == {}
+
+
+# ---------- 派生状态重算（修假冷场用） ----------
+
+
+def test_rebuild_reproduces_the_same_state(mem):
+    """重算不该改变任何东西——战绩没变，派生结论就该一模一样。"""
+    for i in range(5):
+        _battle(mem, post_id=f"p{i}", outcome="多轮激辩", rounds=3)
+    for i in range(3):
+        _battle(mem, post_id=f"c{i}", opponent="Ghost", outcome="冷场")
+
+    before = json.loads(json.dumps(mem.data))
+    mem.rebuild_derived_state()
+
+    assert mem.data == before
+
+
+def test_dropping_phantom_cold_records_frees_the_opponent(mem):
+    """假冷场删掉之后，被冤枉进免战名单的对手要放出来。"""
+    _battle(mem, post_id="win", outcome="对方改口", rounds=4)  # +20，垫高才看得出扣分
+    for i in range(3):
+        _battle(mem, post_id=f"c{i}", opponent="Ghost", outcome="冷场")
+    assert "Ghost" in mem.data["lists"]["truce_list"]
+    assert mem.data["state"]["gang_power"] == 14  # 20 - 2*3
+
+    dropped = mem.drop_battles(lambda b: b["outcome"] == "冷场")
+
+    assert len(dropped) == 3
+    assert mem.data["lists"]["truce_list"] == []
+    assert [b["post_id"] for b in mem.data["battles"]] == ["win"]
+    # -2 分一条也要退回去
+    assert mem.data["state"]["gang_power"] == 20
+
+
+def test_dropping_phantom_cold_records_rehabilitates_the_angle(mem):
+    """被假冷场打成『钝刀』的角度，删干净之后要回到利刃。"""
+    for i in range(4):
+        _battle(mem, post_id=f"c{i}", angle_used="3.6", outcome="冷场")
+    assert "3.6" in mem.data["lists"]["blunt_angles"]
+
+    for i in range(4):
+        _battle(mem, post_id=f"w{i}", angle_used="3.6", outcome="多轮激辩", rounds=3)
+    mem.drop_battles(lambda b: b["outcome"] == "冷场")
+
+    assert mem.data["lists"]["blunt_angles"] == []
+    assert "3.6" in mem.data["lists"]["sharp_angles"]
+
+
+def test_drop_keeps_unrelated_battles(mem):
+    _battle(mem, post_id="keep", outcome="对方改口", rounds=4)
+    _battle(mem, post_id="drop", outcome="冷场")
+
+    mem.drop_battles(lambda b: b["outcome"] == "冷场")
+
+    assert [b["post_id"] for b in mem.data["battles"]] == ["keep"]
+    assert mem.data["state"]["gang_power"] == 20

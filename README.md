@@ -18,7 +18,7 @@
 ```bash
 pip install -r requirements.txt
 cp .env.example .env          # 填 MOLTBOOK_API_KEY 和 ANTHROPIC_API_KEY
-python -m pytest tests/ -q    # 26 个测试，不需要任何 key
+python -m pytest tests/ -q    # 145 个测试，不需要任何 key
 python scripts/preflight.py   # 上线前自检：密钥、端点、目录一次查完
 python scripts/heartbeat.py --dry-run --max-new 2   # 空跑，不真的发帖
 ```
@@ -57,6 +57,11 @@ python scripts/heartbeat.py --dry-run --max-new 2   # 空跑，不真的发帖
 | 姿态型 | 话说太满把天聊死了 → 反省，钩子要留缝 |
 
 反过来，能扛住 4 轮以上还能把你问住的「硬骨头」要**加权优先找**——那才是 MadTed 真正想要的对手。
+
+判冷场有个前提：**必须真的去评论区看过**。跟进阶段每轮直接轮询各讨论串的
+`GET /posts/{id}/comments`，收件箱（`/home` 的 `activity_on_your_posts`）只用来
+决定先看谁。拉取失败的那一轮不计入闲置——"我没看见"和"没人理我"是两回事，
+把前者当后者，一次接口故障就能让好角度进「钝刀」、正常对手进「免战名单」。
 
 ### 📊 每日战报
 
@@ -111,10 +116,11 @@ Moltbook 的 agent 靠平台 **Heartbeat 机制**驱动，约每 4 小时唤醒�
 | `scripts/memory.py` | 记忆与学习。杠力值、冷场五类归因、免战名单、角度统计、跨语言的结构信号权重。 |
 | `scripts/brain.py` | 调 Claude 生成内心独白与回复。人设文档在这里当 system prompt（带 prompt caching）。 |
 | `scripts/heartbeat.py` | 主流程：先跟进老讨论串 → 再开新杠 → 更新记忆。 |
+| `scripts/repair_memory.py` | 一次性维护：清掉跟进阶段瞎掉那阵子留下的假冷场战绩，并重算派生名单。 |
 | `scripts/daily_report.py` | 每日战报。`--no-llm` 可只看原始统计。 |
 | `scripts/show_monologue.py` | 按人设格式打印当天内心独白。**想知道它为什么挑这条帖子就看这个。** |
 | `scripts/show_state.py` | 杠力值、进行中的对线、学到的东西。**Windows 上别直接 `type` json，会乱码。** |
-| `tests/` | 106 个单元测试，中英文样本都覆盖，纯逻辑不需要 key。 |
+| `tests/` | 145 个单元测试，中英文样本都覆盖，纯逻辑不需要 key。 |
 
 ```
 personas/contrarian-agent.md   # 人设 = system prompt
@@ -137,7 +143,9 @@ reports/daily/*.md             # （运行时生成）每日战报
 - [x] 杠点雷达、杠力值、对手档案、忍住了计数器 —— 已实现
 - [ ] 名人堂/耻辱柱、自杠日、月度长文 —— 规格已定，待实现
 
-> ⚠️ `moltbook.com` 在开发环境中无法直接访问，`moltbook_client.py` 的端点整理自公开教程和第三方 SDK。首次接入请对照 [官方开发者文档](https://www.moltbook.com/developers) 核实，端点全部集中在一个文件里，改起来很快。
+> ⚠️ `moltbook.com` 在开发环境中无法直接访问，`moltbook_client.py` 的端点部分整理自公开教程和第三方 SDK，部分对齐了 [HEARTBEAT.md](HEARTBEAT.md)（平台自己给的接入说明）。首次接入请对照 [官方开发者文档](https://www.moltbook.com/developers) 核实，端点全部集中在一个文件里，改起来很快。
+>
+> 教训：曾经有过一版跟进逻辑只认一个没写进官方文档的 `/notifications`，它 404 之后 agent 一条回复都看不见，日报上却是一串"冷场"。**读不到 ≠ 没人理**，这两件事在代码里必须分开。
 
 ---
 

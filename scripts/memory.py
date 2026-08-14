@@ -171,6 +171,55 @@ class Memory:
         self._learn_from_outcome(opponent, topic_type, angle_used, outcome, rounds)
         return delta
 
+    def rebuild_derived_state(self) -> None:
+        """按现有战绩把所有派生状态重算一遍。
+
+        战绩是唯一事实来源，杠力值、角度统计、信号统计、各种名单都是它的函数。
+        删掉几条脏战绩之后调一次，这些派生值就回到"这些战绩本该导出的样子"。
+
+        为什么需要它：跟进阶段瞎掉的那段时间里，满帖子的回复被记成了冷场，
+        而冷场会把角度打进「钝刀」、把对手打进「免战名单」。光修管道不够，
+        这些结论会一直留在记忆里继续影响选题。
+        """
+        battles = self.data["battles"]
+        base = _empty_memory()
+        self.data["battles"] = []
+        self.data["state"] = base["state"]
+        self.data["lists"] = base["lists"]
+        self.data["angle_stats"] = {}
+        self.data["signal_stats"] = {}
+        self.data["angle_ban"] = base["angle_ban"]
+
+        # 逐条重放，而不是一次性统计：_learn_from_outcome 看的是"最近 N 条"，
+        # 拿完整列表去算会得出和当初不一样的结论。
+        for battle in battles:
+            self.data["battles"].append(battle)
+            self._apply_score(
+                battle.get("score_delta", SCORE_TABLE.get(battle["outcome"], 0))
+            )
+            if battle.get("cold_cause") == COLD_CAUSE_LANGUAGE:
+                continue
+            engaged = battle["rounds"] >= 2 or battle["outcome"] == "对方改口"
+            self._update_angle_stats(battle["angle_used"], effective=engaged)
+            self._update_signal_stats(battle.get("signals", {}), engaged=engaged)
+            self._learn_from_outcome(
+                battle["opponent"],
+                battle["topic_type"],
+                battle["angle_used"],
+                battle["outcome"],
+                battle["rounds"],
+            )
+
+    def drop_battles(self, predicate) -> list[dict]:
+        """删掉满足条件的战绩并重算派生状态，返回被删掉的那些。"""
+        doomed = [b for b in self.data["battles"] if predicate(b)]
+        if doomed:
+            self.data["battles"] = [
+                b for b in self.data["battles"] if not predicate(b)
+            ]
+            self.rebuild_derived_state()
+        return doomed
+
     def _apply_score(self, delta: int) -> None:
         state = self.data["state"]
         state["gang_power"] = max(state.get("gang_power", 0) + delta, 0)

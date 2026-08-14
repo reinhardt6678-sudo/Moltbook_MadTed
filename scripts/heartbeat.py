@@ -22,6 +22,7 @@ from __future__ import annotations
 import argparse
 import json
 import logging
+import os
 import sys
 from datetime import date, datetime, timezone
 from pathlib import Path
@@ -31,7 +32,14 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 from brain import Brain, FollowUp, Monologue  # noqa: E402
 from config import load_dotenv  # noqa: E402
 from memory import COLD_CAUSE_LANGUAGE, Memory  # noqa: E402
-from moltbook_client import MoltbookClient, MoltbookError  # noqa: E402
+from moltbook_client import (  # noqa: E402
+    MoltbookClient,
+    MoltbookError,
+    author_name,
+    comment_id,
+    notification_post_id,
+    parent_comment_id,
+)
 import radar  # noqa: E402
 from triage import Triage, split_redlines  # noqa: E402
 
@@ -43,6 +51,10 @@ THREADS_PATH = ROOT / "memory" / "active-threads.json"
 
 # 软保底：单帖最多来回多少轮（人设 §6.3）。正常应该在角度耗尽时自然结束。
 MAX_ROUNDS = 8
+
+# 单轮最多轮询几个讨论串的评论区。正常同时进行的对线远少于这个数，
+# 这个上限只是防止 active-threads.json 意外堆积时把限流额度吃光。
+MAX_THREAD_POLLS = 20
 
 
 def _load_threads() -> dict:
@@ -78,67 +90,167 @@ def _format_post(post: dict) -> str:
     )
 
 
-def _format_transcript(thread: dict) -> str:
+def _speaker(thread: dict, turn: dict) -> str:
+    if turn["role"] == "self":
+        return "我(MadTed)"
+    # 半路插进来的第三方也要如实标名，否则独白里会把别人的话当成对手说的
+    return f"@{turn.get('author') or thread['opponent']}"
+
+
+def _format_transcript(thread: dict, pending: list[dict] | None = None) -> str:
     lines = [f"原帖《{thread['title']}》 —— @{thread['opponent']}", ""]
-    for turn in thread["turns"]:
-        who = "我(MadTed)" if turn["role"] == "self" else f"@{thread['opponent']}"
-        lines.append(f"{who}：{turn['text']}")
+    for turn in [*thread["turns"], *(pending or [])]:
+        lines.append(f"{_speaker(thread, turn)}：{turn['text']}")
     return "\n".join(lines)
 
 
 # ---------- 阶段 1：跟进已有讨论串 ----------
 
 
-def follow_up_threads(
-    client: MoltbookClient, brain: Brain, mem: Memory, threads: dict, *, dry_run: bool
-) -> int:
-    """检查已参与的讨论串有没有新回复，有新角度就追，没有就收尾。"""
-    handled = 0
-    sharp, blunt, banned = mem.angle_preference()
-
+def _self_name(client: MoltbookClient) -> str:
+    """自己在 Moltbook 上的名字。取不到就返回空字符串（靠 own_comment_ids 兜底）。"""
+    override = os.environ.get("MADTED_AGENT_NAME", "").strip()
+    if override:
+        return override
     try:
-        notifications = client.get_notifications(unread_only=True)
+        status = client.get_agent_status()
     except MoltbookError as exc:
-        log.error("拉取通知失败：%s", exc)
-        return 0
+        log.warning("拿不到自己的 agent 名字（%s），只能靠自己发过的评论 id 认自己", exc)
+        return ""
+    return str(status.get("name") or status.get("username") or "")
 
-    replied_posts = {
-        str(n.get("post_id") or n.get("target_id") or "")
-        for n in notifications
-        if n.get("type") in ("reply", "comment", "mention")
+
+def _inbox_hints(client: MoltbookClient) -> set[str]:
+    """收件箱点到名的帖子 id，仅用于决定先轮询谁。
+
+    拿不到就返回空集合——收件箱**只是加速器**，不再是能不能看见回复的开关。
+    之前那版把它当唯一入口：端点 404、字段名对不上、或者主人在网页端把通知
+    点成已读，都会让 agent 一条回复都看不见，然后把满帖子的回复记成冷场。
+    """
+    try:
+        activity = client.get_inbox_activity()
+    except MoltbookError as exc:
+        log.warning("拉取收件箱失败（%s），改为直接轮询各讨论串的评论区", exc)
+        return set()
+
+    hints = {notification_post_id(n) for n in activity}
+    hints.discard("")
+    return hints
+
+
+def _new_replies_for(
+    client: MoltbookClient, post_id: str, thread: dict, self_name: str
+) -> list[dict] | None:
+    """本轮该讨论串里冲我来的新回复。
+
+    返回 None 表示**这次没查成**（拉取失败），和"查了但没有新回复"是两回事——
+    前者不能拿去当冷场的证据。
+    """
+    try:
+        replies = client.get_replies(post_id)
+    except MoltbookError as exc:
+        log.error("拉取 %s 的回复失败：%s", post_id, exc)
+        return None
+
+    seen = set(thread.get("seen_reply_ids", []))
+    own = set(thread.get("own_comment_ids", []))
+    opponent = thread["opponent"]
+    # 老讨论串没存过 own_comment_ids，status 端点也可能不返回名字。
+    # 这时靠原文比对认自己——比认错人去和自己对线强。
+    own_texts = {t["text"] for t in thread["turns"] if t["role"] == "self"}
+
+    fresh = []
+    for reply in replies:
+        rid = comment_id(reply)
+        if rid and (rid in seen or rid in own):
+            continue
+
+        author = author_name(reply)
+        if author and self_name and author == self_name:
+            # 自己发的评论。不排掉的话会被当成对手的话写进 transcript，
+            # 于是 MadTed 开始和自己对线。
+            continue
+        if (reply.get("content") or reply.get("body") or "") in own_texts:
+            continue
+
+        # 只在**能确定是回给别人**时才排除：父级明确指向不是我的评论、
+        # 且作者也不是原帖作者。字段缺失一律按"可能是冲我来的"处理——
+        # 宁可多读一条无关评论，也不能把真回复漏成冷场。
+        parent = parent_comment_id(reply)
+        if own and parent and parent not in own and author != opponent:
+            continue
+
+        fresh.append(reply)
+    return fresh
+
+
+def _reply_to_turn(reply: dict) -> dict:
+    """把 API 返回的评论转成对线记录里的一轮。"""
+    return {
+        "role": "opponent",
+        "author": author_name(reply),
+        "text": reply.get("content") or reply.get("body") or "",
     }
 
-    for post_id, thread in list(threads.items()):
-        if thread.get("closed"):
-            continue
-        if post_id not in replied_posts:
-            continue
 
-        try:
-            replies = client.get_replies(post_id)
-        except MoltbookError as exc:
-            log.error("拉取 %s 的回复失败：%s", post_id, exc)
-            continue
+def _commit_replies(thread: dict, replies: list[dict], turns: list[dict]) -> None:
+    """把回复写进对线记录。只有在确定要用它们之后才调用。"""
+    thread["turns"].extend(turns)
+    for reply in replies:
+        rid = comment_id(reply)
+        if rid:
+            thread.setdefault("seen_reply_ids", []).append(rid)
 
-        new_replies = [
-            r for r in replies if str(r.get("id")) not in thread.get("seen_reply_ids", [])
-        ]
+
+def follow_up_threads(
+    client: MoltbookClient, brain: Brain, mem: Memory, threads: dict, *, dry_run: bool
+) -> tuple[int, set[str]]:
+    """检查已参与的讨论串有没有新回复，有新角度就追，没有就收尾。
+
+    返回 (跟进数, 本轮真正查清楚了的 post_id 集合)。第二项给 _reap_cold_threads：
+    只有确认过"评论区里确实没有新回复"的串才够格计入冷场，拉取失败的不算。
+    """
+    handled = 0
+    checked: set[str] = set()
+    sharp, blunt, banned = mem.angle_preference()
+
+    self_name = _self_name(client)
+    hints = _inbox_hints(client)
+
+    open_threads = [(pid, t) for pid, t in threads.items() if not t.get("closed")]
+    # 通知点过名的排前面，轮询上限被打满时先保证这些
+    open_threads.sort(key=lambda item: item[0] not in hints)
+    if len(open_threads) > MAX_THREAD_POLLS:
+        log.warning(
+            "有 %d 个进行中的讨论串，本轮只轮询前 %d 个",
+            len(open_threads),
+            MAX_THREAD_POLLS,
+        )
+        open_threads = open_threads[:MAX_THREAD_POLLS]
+
+    for post_id, thread in open_threads:
+        new_replies = _new_replies_for(client, post_id, thread, self_name)
+        if new_replies is None:
+            continue
+        checked.add(post_id)
         if not new_replies:
             continue
 
-        for reply in new_replies:
-            thread["turns"].append({"role": "opponent", "text": reply.get("content", "")})
-            thread.setdefault("seen_reply_ids", []).append(str(reply.get("id")))
+        # 有人接话了，闲置计数清零——不清零的话，一个每轮都有回复的热闹
+        # 讨论串照样会在第 3 个周期被判冷场。
+        thread["idle_cycles"] = 0
+        pending = [_reply_to_turn(r) for r in new_replies]
 
         # 软保底：轮数到顶就强制收尾
         if thread["rounds"] >= MAX_ROUNDS:
             log.info("%s 已达软保底 %d 轮，收尾", post_id, MAX_ROUNDS)
+            _commit_replies(thread, new_replies, pending)
             _close_thread(mem, thread, post_id, outcome="多轮激辩", note="到软保底轮数，主动收尾")
             handled += 1
             continue
 
         decision: FollowUp | None = brain.follow_up(
-            _format_transcript(thread),
+            _format_transcript(thread, pending=pending),
             thread.get("used_angles", []),
             sharp=sharp,
             blunt=blunt,
@@ -147,8 +259,13 @@ def follow_up_threads(
             target_language=thread.get("post_language", ""),
         )
         if decision is None:
+            # 大脑这轮没给出结果。回复**不**记进 seen_reply_ids，下轮重来；
+            # 记了就等于永久吞掉这条回复，然后这串会以 rounds=1 被判冷场。
+            log.warning("%s 有 %d 条新回复但大脑没给出决定，留到下轮重试",
+                        post_id, len(new_replies))
             continue
 
+        _commit_replies(thread, new_replies, pending)
         _append_monologue(
             {
                 "ts": datetime.now(timezone.utc).isoformat(),
@@ -168,10 +285,13 @@ def follow_up_threads(
             log.info("[dry-run] 追问 %s: %s", post_id, decision.reply)
         else:
             try:
-                client.create_comment(post_id, decision.reply)
+                result = client.create_comment(post_id, decision.reply)
             except MoltbookError as exc:
                 log.error("追问发送失败：%s", exc)
                 continue
+            _remember_own_comment(thread, result)
+            # 这帖的回复已经处理完了，销掉未读，别让主人的未读数一直涨
+            client.mark_post_read(post_id)
 
         thread["turns"].append({"role": "self", "text": decision.reply})
         thread["reply_language"] = radar.detect_language(decision.reply)
@@ -184,7 +304,18 @@ def follow_up_threads(
             outcome = "我认输" if decision.conceded else "多轮激辩"
             _close_thread(mem, thread, post_id, outcome=outcome, note=decision.thinking[:120])
 
-    return handled
+    return handled, checked
+
+
+def _remember_own_comment(thread: dict, result: dict | None) -> None:
+    """记下自己发出去的评论 id。
+
+    两个用处：认出评论区里哪条是自己说的（否则会自己跟自己对线），
+    以及判断别人的回复是不是冲我来的（parent_id 指向它）。
+    """
+    rid = comment_id(result or {})
+    if rid:
+        thread.setdefault("own_comment_ids", []).append(rid)
 
 
 def _cold_cause(thread: dict) -> str:
@@ -223,15 +354,31 @@ def _close_thread(mem: Memory, thread: dict, post_id: str, *, outcome: str, note
     log.info("讨论串 %s 收尾：%s（%d 轮）", post_id, outcome, thread["rounds"])
 
 
-def _reap_cold_threads(mem: Memory, threads: dict, *, stale_cycles: int = 3) -> None:
-    """连续几个周期没人回应的讨论串判为冷场，归因后关闭（人设 §8.2）。"""
+def _reap_cold_threads(
+    mem: Memory, threads: dict, checked: set[str], *, stale_cycles: int = 3
+) -> None:
+    """连续几个周期没人回应的讨论串判为冷场，归因后关闭（人设 §8.2）。
+
+    只有 checked 里的串——本轮真的读到了评论区、确认没有新回复——才计闲置。
+    拉取失败的串不能计：那是"我没看见"，不是"没人理我"。把前者当后者，
+    -2 杠力值事小，§8.2 的归因会把好角度记成钝刀、把正常对手拉进免战名单，
+    一次接口故障能让记忆歪很久。
+    """
     for post_id, thread in threads.items():
-        if thread.get("closed"):
+        if thread.get("closed") or post_id not in checked:
             continue
         thread["idle_cycles"] = thread.get("idle_cycles", 0) + 1
-        if thread["idle_cycles"] >= stale_cycles and thread["rounds"] <= 1:
+        if thread["idle_cycles"] < stale_cycles:
+            continue
+        if thread["rounds"] <= 1:
             _close_thread(
                 mem, thread, post_id, outcome="冷场", note="连续多个周期零回应"
+            )
+        else:
+            # 来回过几轮才断的，不是冷场——对方接了招，只是没接到底。
+            # 按冷场归因会冤枉这个角度和这个对手。
+            _close_thread(
+                mem, thread, post_id, outcome="一轮即止", note="对方停止回应，收尾"
             )
 
 
@@ -353,14 +500,18 @@ def open_new_battles(
             restraint.append(monologue.restraint_reason or "杠点太弱")
             continue
 
+        own_comment_ids: list[str] = []
         if dry_run:
             log.info("[dry-run] 对 %s 出手: %s", cand.post_id, monologue.reply)
         else:
             try:
-                client.create_comment(cand.post_id, monologue.reply)
+                result = client.create_comment(cand.post_id, monologue.reply)
             except MoltbookError as exc:
                 log.error("评论发送失败：%s", exc)
                 continue
+            own_id = comment_id(result or {})
+            if own_id:
+                own_comment_ids.append(own_id)
 
         # 回复实际用的语言按发出去的文本判定，不信模型自报的 reply_language——
         # 冷场归因要靠它排除无效样本，自报可能和实际不符。
@@ -383,6 +534,7 @@ def open_new_battles(
             "used_angles": [monologue.angle],
             "turns": [{"role": "self", "text": monologue.reply}],
             "seen_reply_ids": [],
+            "own_comment_ids": own_comment_ids,
             "idle_cycles": 0,
             "opened_at": datetime.now(timezone.utc).isoformat(),
             "post_language": post_language,
@@ -419,10 +571,10 @@ def run_cycle(
     log.info("=== heartbeat 开始 | 杠力值 %s (%s) ===",
              mem.data["state"]["gang_power"], mem.data["state"]["rank"])
 
-    followed = follow_up_threads(client, brain, mem, threads, dry_run=dry_run)
-    log.info("阶段1：跟进了 %d 个讨论串", followed)
+    followed, checked = follow_up_threads(client, brain, mem, threads, dry_run=dry_run)
+    log.info("阶段1：跟进了 %d 个讨论串（查清 %d 个）", followed, len(checked))
 
-    _reap_cold_threads(mem, threads)
+    _reap_cold_threads(mem, threads, checked)
 
     engaged, restraint = open_new_battles(
         client,

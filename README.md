@@ -18,9 +18,9 @@
 ```bash
 pip install -r requirements.txt
 cp .env.example .env          # 填 MOLTBOOK_API_KEY 和 ANTHROPIC_API_KEY
-python -m pytest tests/ -q    # 145 个测试，不需要任何 key
+python -m pytest tests/ -q    # 169 个测试，不需要任何 key
 python scripts/preflight.py   # 上线前自检：密钥、端点、目录一次查完
-python scripts/heartbeat.py --dry-run --max-new 2   # 空跑，不真的发帖
+python scripts/heartbeat.py --dry-run              # 空跑，不真的发帖
 ```
 
 ## MadTed 的设计要点
@@ -96,13 +96,21 @@ python scripts/heartbeat.py --dry-run --max-new 2   # 空跑，不真的发帖
 
 ## 运行节奏
 
-Moltbook 的 agent 靠平台 **Heartbeat 机制**驱动，约每 4 小时唤醒一次，**频率不是你能自己调的旋钮**。MadTed 的节奏建议：
+**默认每小时一轮**（`0 * * * *`，见 [docs/SETUP.md](docs/SETUP.md) 第五步）。
 
-1. 每次唤醒先检查已参与讨论串的新回复 → 有新角度就追，没有就收尾
-2. 剩余精力再去开新杠
-3. 不要绕开 heartbeat 高频刷回复——那是 spam 的典型特征
+先说清一件容易混的事：Moltbook 那个"4 小时"指的是**平台 Heartbeat 唤醒 agent 的频率**，不是发帖限制，也管不到本仓库——这些脚本是主动拉取式的，跑多勤由你的定时器决定。平台侧真正卡人的是**评论 50 条/天**（发帖 1 条/30 分钟对 MadTed 没用，它只评论不发主题帖）。
+
+所以要管的不是"多久跑一轮"，是"一天总共发了多少条"：
+
+1. 每轮先检查已参与讨论串的新回复 → 有新角度就追，没有就收尾
+2. 剩余额度再去开新杠（`--max-new 1`，让额度优先留给老对手）
+3. 跨轮总量由 `scripts/budget.py` 的**滚动 24 小时额度**兜底，默认 40 条
+
+第 3 条不能靠 `moltbook_client.py` 里的冷却：那个用的是 `time.monotonic()`，只在一个进程内有效，而 cron 每小时拉起的是新进程——**上一轮发过多少条，只有磁盘记得住**。
 
 > 一天有效追问 3 轮扎实的新角度，比一天刷 30 条车轱辘话更有战斗力。
+
+跑得勤了还有个连带影响：判冷场原来只数"连续 3 个周期没人回应"，4 小时一轮时它等于 12 小时，改成每小时就悄悄变成了 3 小时。现在周期数之外还要过一道 12 小时的墙上时间——**定时器频率是运维参数，不该顺手改掉 agent 的学习结论**。
 
 ## 代码结构
 
@@ -113,6 +121,7 @@ Moltbook 的 agent 靠平台 **Heartbeat 机制**驱动，约每 4 小时唤醒�
 | `scripts/moltbook_client.py` | Moltbook API 封装。限流、退避重试、发帖/评论冷却。**改端点只改这个文件。** |
 | `scripts/radar.py` | 杠点雷达 **L0 结构层**。纯逻辑，靠 emoji 密度/有无出处/赞评比这类语言无关信号打分和否决。 |
 | `scripts/triage.py` | 杠点雷达 **L1 语义层**。用 Haiku 批量判断论证结构有没有缺陷，约 $0.02 一轮。 |
+| `scripts/budget.py` | 滚动 24 小时评论额度，**落盘**。cron 每轮都是新进程，进程内的冷却记不住跨轮的总量，只有它记得住。 |
 | `scripts/memory.py` | 记忆与学习。杠力值、冷场五类归因、免战名单、角度统计、跨语言的结构信号权重。 |
 | `scripts/brain.py` | 调 Claude 生成内心独白与回复。人设文档在这里当 system prompt（带 prompt caching）。 |
 | `scripts/heartbeat.py` | 主流程：先跟进老讨论串 → 再开新杠 → 更新记忆。 |
@@ -120,7 +129,7 @@ Moltbook 的 agent 靠平台 **Heartbeat 机制**驱动，约每 4 小时唤醒�
 | `scripts/daily_report.py` | 每日战报。`--no-llm` 可只看原始统计。 |
 | `scripts/show_monologue.py` | 按人设格式打印当天内心独白。**想知道它为什么挑这条帖子就看这个。** |
 | `scripts/show_state.py` | 杠力值、进行中的对线、学到的东西。**Windows 上别直接 `type` json，会乱码。** |
-| `tests/` | 145 个单元测试，中英文样本都覆盖，纯逻辑不需要 key。 |
+| `tests/` | 169 个单元测试，中英文样本都覆盖，纯逻辑不需要 key。 |
 
 ```
 personas/contrarian-agent.md   # 人设 = system prompt
@@ -129,6 +138,7 @@ tests/                         # 单元测试
 docs/SETUP.md                  # 接入指南
 memory/radar-keywords.json     # 雷达词表（L0 的辅助信号，可手工加词）
 memory/madted-memory.json      # （运行时生成）战绩、名单、统计
+memory/comment-budget.json     # （运行时生成）滚动 24h 已发评论数，跨进程共享
 reports/monologue/*.jsonl      # （运行时生成）每日完整心理活动
 reports/daily/*.md             # （运行时生成）每日战报
 ```

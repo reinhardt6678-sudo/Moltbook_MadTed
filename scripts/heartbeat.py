@@ -10,10 +10,15 @@
   L1  triage.py  Haiku 语义粗筛 约 $0.02  12 条 → 排序 + 剔红线
   L2  brain.py   Sonnet 深度独白 最贵     最多 max-deliberate 条
 
+一轮之内的出手次数由 --max-new 管，**跨轮**的总量由 budget.py 的滚动 24 小时
+额度管。后者必须落盘：cron 每小时拉起一个新进程，进程内的冷却记录跟着一起没了，
+只有文件记得住"今天已经发过多少条"。
+
 用法：
     python scripts/heartbeat.py                # 正常跑
     python scripts/heartbeat.py --dry-run      # 不真的发帖，只打印
     python scripts/heartbeat.py --max-new 2    # 限制本轮最多开 2 个新杠
+    python scripts/heartbeat.py --daily-comments 30   # 收紧 24 小时总额度
     python scripts/heartbeat.py --no-triage    # 跳过 L1，只用 L0 排序
 """
 
@@ -30,6 +35,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 from brain import Brain, FollowUp, Monologue  # noqa: E402
+from budget import DEFAULT_DAILY_COMMENTS, CommentBudget  # noqa: E402
 from config import load_dotenv  # noqa: E402
 from memory import COLD_CAUSE_LANGUAGE, Memory  # noqa: E402
 from moltbook_client import (  # noqa: E402
@@ -55,6 +61,31 @@ MAX_ROUNDS = 8
 # 单轮最多轮询几个讨论串的评论区。正常同时进行的对线远少于这个数，
 # 这个上限只是防止 active-threads.json 意外堆积时把限流额度吃光。
 MAX_THREAD_POLLS = 20
+
+# 判冷场的**墙上时间**下限：从我最后一次出声算起，至少要过这么久。
+#
+# 为什么不能只数周期数：`stale_cycles=3` 这个条件的真实含义取决于你多久跑一次。
+# 4 小时一轮时它等于"12 小时没人理"，改成每小时一轮之后同样的 3 轮只有 3 小时——
+# 对方还没睡醒就被记进「免战名单」，用的角度被记成「钝刀」。定时器频率是运维
+# 参数，不该顺手改掉 agent 的学习结论，所以这里用小时数把两者解耦。
+DEFAULT_COLD_AFTER_HOURS = 12.0
+
+
+def cold_after_hours() -> float:
+    """判冷场要求的最短冷却时长。**运行时**读环境变量，不能在导入时定死——
+    `.env` 是 main() 里才加载的，写成模块常量的话 MADTED_COLD_AFTER_HOURS
+    只有 export 过才生效，写在 .env 里会被静默忽略。"""
+    raw = os.environ.get("MADTED_COLD_AFTER_HOURS", "").strip()
+    if not raw:
+        return DEFAULT_COLD_AFTER_HOURS
+    try:
+        return float(raw)
+    except ValueError:
+        log.warning(
+            "MADTED_COLD_AFTER_HOURS=%r 不是数字，用默认值 %.0f 小时",
+            raw, DEFAULT_COLD_AFTER_HOURS,
+        )
+        return DEFAULT_COLD_AFTER_HOURS
 
 
 def _load_threads() -> dict:
@@ -203,12 +234,22 @@ def _commit_replies(thread: dict, replies: list[dict], turns: list[dict]) -> Non
 
 
 def follow_up_threads(
-    client: MoltbookClient, brain: Brain, mem: Memory, threads: dict, *, dry_run: bool
+    client: MoltbookClient,
+    brain: Brain,
+    mem: Memory,
+    threads: dict,
+    *,
+    dry_run: bool,
+    budget: CommentBudget | None = None,
 ) -> tuple[int, set[str]]:
     """检查已参与的讨论串有没有新回复，有新角度就追，没有就收尾。
 
     返回 (跟进数, 本轮真正查清楚了的 post_id 集合)。第二项给 _reap_cold_threads：
     只有确认过"评论区里确实没有新回复"的串才够格计入冷场，拉取失败的不算。
+
+    `budget=None` 表示不限额，只有测试和手工调用会这样；正常入口一律由
+    run_cycle 传一个进来。跟进排在开新杠前面，所以额度天然优先给老对手——
+    半截撂下一场正在来回的对线，比这轮少开一个新杠难看得多。
     """
     handled = 0
     checked: set[str] = set()
@@ -247,6 +288,12 @@ def follow_up_threads(
             _commit_replies(thread, new_replies, pending)
             _close_thread(mem, thread, post_id, outcome="多轮激辩", note="到软保底轮数，主动收尾")
             handled += 1
+            continue
+
+        if budget is not None and budget.remaining <= 0:
+            # 额度用完就别问大脑了——想出来也发不出去，白花一次 API 钱。
+            # 这些回复**不**记进 seen_reply_ids，下轮额度回来了再接着答。
+            log.warning("%s 有 %d 条新回复，但%s，留到下轮", post_id, len(new_replies), budget.summary())
             continue
 
         decision: FollowUp | None = brain.follow_up(
@@ -293,7 +340,11 @@ def follow_up_threads(
             # 这帖的回复已经处理完了，销掉未读，别让主人的未读数一直涨
             client.mark_post_read(post_id)
 
+        if budget is not None:
+            budget.spend()
+
         thread["turns"].append({"role": "self", "text": decision.reply})
+        thread["last_activity_at"] = datetime.now(timezone.utc).isoformat()
         thread["reply_language"] = radar.detect_language(decision.reply)
         thread["rounds"] += 1
         if decision.angle != "none":
@@ -354,21 +405,54 @@ def _close_thread(mem: Memory, thread: dict, post_id: str, *, outcome: str, note
     log.info("讨论串 %s 收尾：%s（%d 轮）", post_id, outcome, thread["rounds"])
 
 
+def _quiet_hours(thread: dict) -> float | None:
+    """我最后一次出声到现在过了多少小时。没有时间戳的老串返回 None。"""
+    stamp = thread.get("last_activity_at") or thread.get("opened_at")
+    if not stamp:
+        return None
+    try:
+        when = datetime.fromisoformat(stamp)
+    except (TypeError, ValueError):
+        return None
+    if when.tzinfo is None:
+        when = when.replace(tzinfo=timezone.utc)
+    return (datetime.now(timezone.utc) - when).total_seconds() / 3600
+
+
 def _reap_cold_threads(
-    mem: Memory, threads: dict, checked: set[str], *, stale_cycles: int = 3
+    mem: Memory,
+    threads: dict,
+    checked: set[str],
+    *,
+    stale_cycles: int = 3,
+    min_quiet_hours: float | None = None,
 ) -> None:
-    """连续几个周期没人回应的讨论串判为冷场，归因后关闭（人设 §8.2）。
+    """连续几个周期没人回应、且确实冷了足够久的讨论串判为冷场（人设 §8.2）。
 
     只有 checked 里的串——本轮真的读到了评论区、确认没有新回复——才计闲置。
     拉取失败的串不能计：那是"我没看见"，不是"没人理我"。把前者当后者，
     -2 杠力值事小，§8.2 的归因会把好角度记成钝刀、把正常对手拉进免战名单，
     一次接口故障能让记忆歪很久。
+
+    周期数之外还要过 `min_quiet_hours` 这道墙上时间：周期数说的是"我查了几次"，
+    小时数说的才是"人家晾了我多久"。只看前者的话，把定时器从 4 小时调成 1 小时
+    就等于把冷场判定线从 12 小时偷偷改成 3 小时——同一批对手会突然集体变"冷淡"，
+    而真实原因只是我查得勤了。
     """
+    if min_quiet_hours is None:
+        min_quiet_hours = cold_after_hours()
     for post_id, thread in threads.items():
         if thread.get("closed") or post_id not in checked:
             continue
         thread["idle_cycles"] = thread.get("idle_cycles", 0) + 1
         if thread["idle_cycles"] < stale_cycles:
+            continue
+        quiet = _quiet_hours(thread)
+        if quiet is not None and quiet < min_quiet_hours:
+            log.debug(
+                "%s 已闲置 %d 个周期，但才过了 %.1f 小时（不足 %.1f），先不判",
+                post_id, thread["idle_cycles"], quiet, min_quiet_hours,
+            )
             continue
         if thread["rounds"] <= 1:
             _close_thread(
@@ -395,6 +479,7 @@ def open_new_battles(
     max_deliberate: int,
     dry_run: bool,
     triage: Triage | None = None,
+    budget: CommentBudget | None = None,
 ) -> tuple[int, list[str]]:
     """浏览 feed，挑杠点最多的帖子出手。返回 (出手数, 放弃理由列表)。
 
@@ -406,6 +491,15 @@ def open_new_battles(
     """
     keywords = radar.load_keywords()
     sharp, blunt, banned = mem.angle_preference()
+
+    if budget is not None and budget.remaining < max_new:
+        # 先把 max_new 压到额度以内，省的是 L2 的钱：否则会照常深挖 max_new 条，
+        # 挖完才发现发不出去。跟进阶段已经先花过一部分额度了，这里看到的是余额。
+        log.info("%s，本轮最多开 %d 个新杠", budget.summary(), budget.remaining)
+        max_new = budget.remaining
+
+    if max_new <= 0:
+        return 0, []
 
     try:
         posts = client.get_feed(sort="hot", limit=60)
@@ -513,6 +607,9 @@ def open_new_battles(
             if own_id:
                 own_comment_ids.append(own_id)
 
+        if budget is not None:
+            budget.spend()
+
         # 回复实际用的语言按发出去的文本判定，不信模型自报的 reply_language——
         # 冷场归因要靠它排除无效样本，自报可能和实际不符。
         actual_reply_language = radar.detect_language(monologue.reply)
@@ -537,6 +634,7 @@ def open_new_battles(
             "own_comment_ids": own_comment_ids,
             "idle_cycles": 0,
             "opened_at": datetime.now(timezone.utc).isoformat(),
+            "last_activity_at": datetime.now(timezone.utc).isoformat(),
             "post_language": post_language,
             "reply_language": actual_reply_language,
             "signals": cand.signals,
@@ -554,12 +652,13 @@ def open_new_battles(
 def run_cycle(
     *,
     dry_run: bool = False,
-    max_new: int = 3,
+    max_new: int = 1,
     effort: str = "medium",
     model: str | None = None,
     max_deliberate: int = 4,
     use_triage: bool = True,
     triage_model: str | None = None,
+    daily_comments: int | None = None,
 ) -> None:
     client = MoltbookClient.from_env(dry_run=dry_run)
     brain = Brain(effort=effort, model=model)
@@ -567,11 +666,15 @@ def run_cycle(
     triage = Triage(client=brain.client, model=triage_model) if use_triage else None
     mem = Memory()
     threads = _load_threads()
+    # 落盘的额度，跨进程有效——每小时一轮时唯一挡得住"一天发爆"的东西
+    budget = CommentBudget(cap=daily_comments, dry_run=dry_run)
 
-    log.info("=== heartbeat 开始 | 杠力值 %s (%s) ===",
-             mem.data["state"]["gang_power"], mem.data["state"]["rank"])
+    log.info("=== heartbeat 开始 | 杠力值 %s (%s) | %s ===",
+             mem.data["state"]["gang_power"], mem.data["state"]["rank"], budget.summary())
 
-    followed, checked = follow_up_threads(client, brain, mem, threads, dry_run=dry_run)
+    followed, checked = follow_up_threads(
+        client, brain, mem, threads, dry_run=dry_run, budget=budget
+    )
     log.info("阶段1：跟进了 %d 个讨论串（查清 %d 个）", followed, len(checked))
 
     _reap_cold_threads(mem, threads, checked)
@@ -585,19 +688,34 @@ def run_cycle(
         max_deliberate=max_deliberate,
         dry_run=dry_run,
         triage=triage,
+        budget=budget,
     )
     log.info("阶段2：开了 %d 个新杠，忍住了 %d 条", engaged, len(restraint))
 
     mem.record_restraint(restraint)
     mem.save()
     _save_threads(threads)
-    log.info("=== heartbeat 结束 | 杠力值 %s ===", mem.data["state"]["gang_power"])
+    log.info("=== heartbeat 结束 | 杠力值 %s | %s ===",
+             mem.data["state"]["gang_power"], budget.summary())
 
 
 def main() -> None:
     parser = argparse.ArgumentParser(description="MadTed 的一次 heartbeat 周期")
     parser.add_argument("--dry-run", action="store_true", help="不真的发评论，只打印")
-    parser.add_argument("--max-new", type=int, default=3, help="本轮最多开几个新杠")
+    parser.add_argument(
+        "--max-new",
+        type=int,
+        default=1,
+        help="本轮最多开几个新杠。默认 1 是按每小时一轮配的——4 小时一轮可以调到 3",
+    )
+    parser.add_argument(
+        "--daily-comments",
+        type=int,
+        default=None,
+        help="滚动 24 小时内最多发几条评论（出手 + 追问合计）。"
+        f"默认 {DEFAULT_DAILY_COMMENTS}，也可设 MADTED_DAILY_COMMENTS 环境变量。"
+        "平台文档写的是 50 条/天",
+    )
     parser.add_argument(
         "--effort",
         default="medium",
@@ -643,6 +761,7 @@ def main() -> None:
         max_deliberate=args.max_deliberate,
         use_triage=not args.no_triage,
         triage_model=args.triage_model,
+        daily_comments=args.daily_comments,
     )
 
 

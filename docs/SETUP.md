@@ -213,16 +213,23 @@ L1 挂了（API 报错、解析失败）会自动退化成这个模式，不会�
 
 ## 第五步：定时运行
 
-**关键前提：Moltbook agent 本身是靠平台 Heartbeat 驱动的（约 4 小时一次）。**
-本仓库的脚本是主动拉取式的，你自己控制频率——但**不要**因此就调到几分钟一次。
-理由见 `personas/contrarian-agent.md` §6.1：高频刷回复是 spam 的典型特征，
-Moltbook 有 moderator bot（Clawd Clawderberg）专门清垃圾封号。
+**先澄清一个容易混的前提。** "4 小时"指的是 Moltbook **平台 Heartbeat 唤醒
+agent 的频率**，不是发帖限制，也管不到本仓库——这些脚本是**主动拉取**式的，
+跑多勤完全由你的定时器决定，从来不用等平台叫。平台侧真正的硬限制是这两条
+（见 `HEARTBEAT.md`，注册满 24 小时后）：
 
-**建议 4 小时一次，和平台节奏对齐：**
+| 限制 | 数值 | 谁会先撞上 |
+|---|---|---|
+| 发帖 | 1 条 / 30 分钟 | 用不上——MadTed 只评论，不发主题帖 |
+| 评论 | 20 秒冷却，**50 条 / 天** | **这条**。出手和追问都算评论 |
+
+所以真正要管的不是"多久跑一轮"，是"一天总共发了多少条"。
+
+### 每小时一轮
 
 ```cron
-# 每 4 小时跑一次 heartbeat
-0 */4 * * * cd /path/to/Moltbook_MadTed && mkdir -p logs && .venv/bin/python scripts/heartbeat.py --max-new 3 >> logs/heartbeat.log 2>&1
+# 每小时跑一次 heartbeat
+0 * * * * cd /path/to/Moltbook_MadTed && mkdir -p logs && .venv/bin/python scripts/heartbeat.py --max-new 1 >> logs/heartbeat.log 2>&1
 
 # 每天北京时间 22:00 出战报
 0 22 * * * cd /path/to/Moltbook_MadTed && mkdir -p logs && .venv/bin/python scripts/daily_report.py >> logs/report.log 2>&1
@@ -230,34 +237,122 @@ Moltbook 有 moderator bot（Clawd Clawderberg）专门清垃圾封号。
 
 （cron 用的是服务器本地时区，注意换算。）
 
-⚠️ **cron 的经典坑：`logs/` 不存在则整条命令失败**，而且失败得很安静——
-重定向在命令执行前就报错了，你连日志都看不到。上面的 `mkdir -p logs` 就是干这个的
-（`scripts/preflight.py` 也会顺手建好）。
+**`--max-new 1` 不是保守，是分配问题。** 每轮开的新杠会挤占同一份评论额度，
+而这份额度更该花在追问老对手身上——人设 §6.1 那句"一天有效追问 3 轮扎实的
+新角度，胜过一天刷 30 条车轱辘话"说的就是这个。24 轮 × 1 条 = 24 条新杠，
+剩下十几条留给跟进，正好。想更活跃就调 `--max-new 2`，但先看几天日报里
+"多轮激辩"的比例有没有掉。
 
-密钥不用操心：cron 不读你的 `.bashrc`，但脚本会自己读仓库根目录的 `.env`，
-所以不需要在 crontab 里 source 任何东西。
+**只想白天活跃**就把小时字段写成范围，凌晨不跑：
 
-装好后别等 4 小时，先在**模拟 cron 的干净环境**里跑一次自检——验的是 Python 路径、
-依赖和目录权限在没有你 shell 配置的情况下还成不成立：
+```cron
+0 9-23 * * *    # 早 9 点到晚 11 点，每小时一轮
+```
+
+### 一天最多发多少条：`--daily-comments`
+
+改成每小时之后，**光靠 `--max-new` 是挡不住发爆的**。`moltbook_client.py` 里的
+冷却用的是 `time.monotonic()`，只在一个进程内有效；cron 每小时拉起一个新进程，
+上一轮的记录跟着进程一起没了。所以额度必须落盘——这就是 `scripts/budget.py`：
+
+- 滚动 24 小时窗口，默认上限 **40 条**（平台是 50，留 20% 余量）
+- 出手和追问都记账，**追问优先**：跟进阶段排在开新杠前面，额度自然先给老对手
+- 额度见底时**连 feed 都不拉**——L2 深挖出来也发不出去，纯烧钱
+- 每发一条立刻写文件，进程被杀也不会把账丢掉
+
+改上限：`--daily-comments 30`，或者在 `.env` 里写 `MADTED_DAILY_COMMENTS=30`。
+随时可以查还剩多少：
+
+```bash
+python scripts/show_state.py     # 顶上第二行就是「评论额度 12/40（滚动 24h）」
+```
+
+用滚动窗口而不是自然日，是因为平台按哪个时区跨天我们并不知道。代价是额度不会
+在零点一次性清零，而是慢慢回来——发满之后日志会写"约 XX 分钟后回来一个"。
+
+### 跑得勤了，"冷场"的判定别跟着变
+
+判冷场原来只数周期数：连续 3 轮没人回应就归因、记进免战名单。4 小时一轮时
+这等于"12 小时没人理"；**直接改成每小时，同样的 3 轮只剩 3 小时**——对方还没
+上线就被记成冷淡，用过的角度被记成「钝刀」，而真实原因只是你查得勤了。
+
+现在周期数之外还要过一道墙上时间，默认 **12 小时**，两个条件同时满足才判。
+一般不用动；真要调：`.env` 里写 `MADTED_COLD_AFTER_HOURS=8`。
+
+### 装完先验，别等一小时
+
+在**模拟 cron 的干净环境**里跑一次自检——验的是 Python 路径、依赖和目录权限
+在没有你 shell 配置的情况下还成不成立：
 
 ```bash
 env -i HOME="$HOME" PATH=/usr/bin:/bin sh -c \
   'cd /path/to/Moltbook_MadTed && .venv/bin/python scripts/preflight.py'
 ```
 
-**Windows 用任务计划程序（Task Scheduler）代替 cron：**
+⚠️ **cron 的经典坑：`logs/` 不存在则整条命令失败**，而且失败得很安静——
+重定向在命令执行前就报错了，你连日志都看不到。上面 crontab 里的 `mkdir -p logs`
+就是干这个的（`scripts/preflight.py` 也会顺手建好）。
+
+密钥不用操心：cron 不读你的 `.bashrc`，但脚本会自己读仓库根目录的 `.env`，
+所以不需要在 crontab 里 source 任何东西。
+
+### Windows：用任务计划程序代替 cron
 
 ```powershell
-# 每 4 小时跑一次 heartbeat
+# 每小时跑一次 heartbeat
 $action  = New-ScheduledTaskAction -Execute "C:\path\to\Moltbook_MadTed\.venv\Scripts\python.exe" `
-           -Argument "scripts\heartbeat.py --max-new 3" `
+           -Argument "scripts\heartbeat.py --max-new 1" `
            -WorkingDirectory "C:\path\to\Moltbook_MadTed"
 $trigger = New-ScheduledTaskTrigger -Once -At (Get-Date) `
-           -RepetitionInterval (New-TimeSpan -Hours 4)
+           -RepetitionInterval (New-TimeSpan -Hours 1)
 Register-ScheduledTask -TaskName "MadTed heartbeat" -Action $action -Trigger $trigger
 ```
 
 `-WorkingDirectory` 必须指对，脚本靠它找到 `.env` 和 `memory/`。
+
+⚠️ **笔记本合盖休眠期间任务不会跑**，醒来后默认也不补跑。滚动 24 小时额度
+会把这段空窗当成"没发过"，所以醒来那几轮可能连着出手——这是对的，不是 bug。
+真在意就加 `-RunOnlyIfNetworkAvailable` 之类的条件，或者干脆换台常开的机器。
+
+### systemd timer（常开的 Linux 服务器）
+
+比 cron 多的是独立日志和开机自启。`/etc/systemd/system/madted.service`：
+
+```ini
+[Unit]
+Description=MadTed heartbeat
+After=network-online.target
+
+[Service]
+Type=oneshot
+WorkingDirectory=/path/to/Moltbook_MadTed
+ExecStart=/path/to/Moltbook_MadTed/.venv/bin/python scripts/heartbeat.py --max-new 1
+User=youruser
+```
+
+`/etc/systemd/system/madted.timer`：
+
+```ini
+[Unit]
+Description=MadTed heartbeat every hour
+
+[Timer]
+OnCalendar=hourly
+Persistent=true
+RandomizedDelaySec=300
+
+[Install]
+WantedBy=timers.target
+```
+
+```bash
+sudo systemctl daemon-reload && sudo systemctl enable --now madted.timer
+systemctl list-timers madted.timer     # 看下次什么时候跑
+journalctl -u madted.service -f        # 看日志，不用自己重定向
+```
+
+`RandomizedDelaySec=300` 是故意加的：整点零分准时出现是机器人特征，随机推迟
+0-5 分钟更像正常作息。`Persistent=true` 表示关机错过的那次开机后补跑一次。
 
 ---
 
@@ -304,6 +399,7 @@ python scripts/show_state.py --threads   # 只看进行中的对线
 | `scripts/moltbook_client.py` | Moltbook API 封装。限流、重试、冷却都在这里。**改端点只改这个文件。** |
 | `scripts/radar.py` | 杠点雷达 **L0**。纯逻辑结构层：emoji 密度、有无出处、赞评比、代码块。红线否决在这一层。 |
 | `scripts/triage.py` | 杠点雷达 **L1**。Haiku 批量语义粗筛，判断论证结构缺陷。`--no-triage` 可关。 |
+| `scripts/budget.py` | 滚动 24 小时评论额度，**落盘**。cron 每轮都是新进程，只有它记得住一天发过多少条。 |
 | `scripts/memory.py` | 记忆与学习。杠力值、冷场归因、免战名单、角度统计。 |
 | `scripts/brain.py` | 调 Claude 生成内心独白和回复。人设文档在这里被当 system prompt 用。 |
 | `scripts/heartbeat.py` | 主流程。先跟进老讨论串，再开新杠。 |
@@ -320,15 +416,27 @@ python scripts/show_state.py --threads   # 只看进行中的对线
 **贵的不是输入，是输出。** 实测每次判定一条帖子约 **8K 输入 token**（人设文档占大头），
 输出约 2K（内心独白九个字段 + thinking）。而输出单价是输入的 5 倍。
 
-按 `medium` effort、`--max-deliberate 4`、每 4 小时一次（一天 6 次）粗算：
+按 `medium` effort、`--max-deliberate 4` 粗算。**注意频率是直接乘上去的**——
+从 4 小时一轮改成每小时一轮，跑的次数是 6 → 24，账单跟着乘 4：
 
-| 模型 | 单价（输入/输出，每百万 token） | 每次 heartbeat | 每天 |
-|---|---|---|---|
-| `claude-haiku-4-5` | $1 / $5 | 约 $0.05 | **约 $0.3（¥2）** |
-| `claude-sonnet-5` ← 默认 | $3 / $15（8-31 前 $2/$10） | 约 $0.11 | **约 $0.6（¥4.5）** |
-| `claude-opus-5` | $5 / $25 | 约 $0.26 | **约 $1.6（¥11）** |
+| 模型 | 单价（输入/输出，每百万 token） | 每次 heartbeat | 4 小时一轮（6 次/天） | **每小时一轮（24 次/天）** |
+|---|---|---|---|---|
+| `claude-haiku-4-5` | $1 / $5 | 约 $0.05 | 约 $0.3（¥2） | **约 $1.2（¥9）** |
+| `claude-sonnet-5` ← 默认 | $3 / $15（8-31 前 $2/$10） | 约 $0.11 | 约 $0.6（¥4.5） | **约 $2.6（¥19）** |
+| `claude-opus-5` | $5 / $25 | 约 $0.26 | 约 $1.6（¥11） | **约 $6.2（¥45）** |
 
 数字是估算，实际取决于输出长度和当天 feed 里有多少候选帖。**先跑一天看账单再调。**
+
+实际大概率比表里低：`--max-new 1` 时开到第一个新杠就跳出 L2 循环，很多轮
+根本问不满 `--max-deliberate 4` 次。真嫌贵，每小时一轮的推荐组合是
+**`--max-deliberate 2`**（约再省一半，因为省掉的是判"划走"那几次的钱）：
+
+```cron
+0 * * * * cd /path/to/Moltbook_MadTed && mkdir -p logs && .venv/bin/python scripts/heartbeat.py --max-new 1 --max-deliberate 2 >> logs/heartbeat.log 2>&1
+```
+
+另外评论额度见底之后那几轮几乎不花钱——`open_new_battles` 会在拉 feed 前
+就返回，L1/L2 一次都不问。所以"发满 40 条"同时也是成本的天花板。
 
 ### 省钱的四个开关，按效果排序
 
@@ -344,7 +452,7 @@ python scripts/show_state.py --threads   # 只看进行中的对线
    也是要花钱的。这个上限直接砍掉最坏情况。调到 2 能再省一半。
 
    L1 粗筛（`triage.py`）本身很便宜：Haiku 4.5 是 $1/$5，一轮 60 条帖子约
-   9K 输入 + 2.4K 输出 ≈ **$0.02**，一天 6 轮约 $0.13。相比它带来的选题精度，
+   9K 输入 + 2.4K 输出 ≈ **$0.02**，每小时一轮一天约 $0.5。相比它带来的选题精度，
    基本不值得关。真要省就用 `--no-triage`。
 
 3. **`--effort low`**——主要压缩 thinking 的长度，也就是压最贵的输出侧。

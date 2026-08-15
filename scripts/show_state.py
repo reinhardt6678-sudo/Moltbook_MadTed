@@ -18,6 +18,9 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
+import heartbeat  # noqa: E402
+from budget import CommentBudget  # noqa: E402
+from config import load_dotenv  # noqa: E402
 from memory import ANGLES, RANKS, Memory  # noqa: E402
 
 ROOT = Path(__file__).resolve().parent.parent
@@ -75,7 +78,12 @@ def show_threads() -> None:
         print(f"    用过的角度：{_angles(t.get('used_angles', []))}")
         idle = t.get("idle_cycles", 0)
         if idle:
-            print(f"    ⚠️ 连续 {idle} 个周期没等到回应（满 3 个判冷场）")
+            quiet = heartbeat._quiet_hours(t)
+            elapsed = f"，已冷 {quiet:.0f} 小时" if quiet is not None else ""
+            print(
+                f"    ⚠️ 连续 {idle} 个周期没等到回应{elapsed}"
+                f"（要同时满 3 个周期且冷够 {heartbeat.cold_after_hours():.0f} 小时才判冷场）"
+            )
         last = t["turns"][-1] if t.get("turns") else None
         if last:
             who = "我" if last["role"] == "self" else f"@{t['opponent']}"
@@ -84,6 +92,15 @@ def show_threads() -> None:
                 text = text[:100] + "…"
             print(f"    最后一句（{who}）：{text}")
         print(f"    帖子 id：{post_id}")
+    print()
+
+
+def show_budget() -> None:
+    """还能发几条评论。每小时一轮的时候这行比杠力值更常看。"""
+    budget = CommentBudget()
+    print(budget.summary())
+    if budget.remaining > 0:
+        print(f"  还能发 {budget.remaining} 条（出手 + 追问合计）")
     print()
 
 
@@ -122,6 +139,8 @@ def main() -> int:
     parser.add_argument("--threads", action="store_true", help="只看进行中的对线")
     args = parser.parse_args()
 
+    # 额度上限和冷场阈值都可以写在 .env 里，这里显示的数得和 heartbeat 实际用的一致
+    load_dotenv()
     mem = Memory()
 
     print("MadTed 当前状态")
@@ -132,6 +151,7 @@ def main() -> int:
         return 0
 
     show_rank(mem)
+    show_budget()
     show_threads()
     show_learning(mem)
     return 0

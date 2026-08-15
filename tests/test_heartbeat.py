@@ -7,6 +7,7 @@
 from __future__ import annotations
 
 import sys
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 import pytest
@@ -15,6 +16,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "scripts"))
 
 import heartbeat  # noqa: E402
 from brain import FollowUp  # noqa: E402
+from budget import CommentBudget  # noqa: E402
 from moltbook_client import (  # noqa: E402
     MoltbookError,
     author_name,
@@ -99,6 +101,19 @@ def make_thread(**overrides) -> dict:
     }
     thread.update(overrides)
     return thread
+
+
+def _hours_ago(hours: float) -> str:
+    return (datetime.now(timezone.utc) - timedelta(hours=hours)).isoformat()
+
+
+def _spent_budget(*, cap: int) -> CommentBudget:
+    """测试用额度。dry_run 保证既不读也不写仓库里的真实账本。"""
+    return CommentBudget(
+        Path(__file__).resolve().parent / "_never-written-budget.json",
+        cap=cap,
+        dry_run=True,
+    )
 
 
 def a_decision(**overrides) -> FollowUp:
@@ -380,3 +395,151 @@ def test_parent_comment_id_variants(comment, expected):
 )
 def test_notification_post_id_variants(notification, expected):
     assert notification_post_id(notification) == expected
+
+
+# ---------- 判冷场要看墙上时间，不是查了几次 ----------
+#
+# 定时器从 4 小时改成 1 小时之后，同样的 stale_cycles=3 从"12 小时没人理"
+# 变成了"3 小时没人理"。改运维频率不该顺手改掉 agent 的学习结论。
+
+
+def test_recently_active_thread_is_not_cold_just_because_we_checked_often():
+    """刚出手 1 小时，查了 3 遍没人回——那是人家没上线，不是冷场。"""
+    client = FakeClient({"p1": []})
+    mem = FakeMemory()
+    threads = {"p1": make_thread(idle_cycles=2, last_activity_at=_hours_ago(1))}
+
+    _, checked = heartbeat.follow_up_threads(
+        client, FakeBrain(None), mem, threads, dry_run=False
+    )
+    heartbeat._reap_cold_threads(mem, threads, checked)
+
+    assert threads["p1"]["idle_cycles"] == 3   # 照常计数
+    assert threads["p1"]["closed"] is False    # 但先不判
+    assert mem.battles == []
+
+
+def test_thread_quiet_long_enough_is_still_reaped():
+    """晾了一整天确实是冷场，时间够了就该判。"""
+    client = FakeClient({"p1": []})
+    mem = FakeMemory()
+    threads = {"p1": make_thread(idle_cycles=2, last_activity_at=_hours_ago(20))}
+
+    _, checked = heartbeat.follow_up_threads(
+        client, FakeBrain(None), mem, threads, dry_run=False
+    )
+    heartbeat._reap_cold_threads(mem, threads, checked)
+
+    assert threads["p1"]["closed"] is True
+    assert mem.battles[0]["outcome"] == "冷场"
+
+
+def test_thread_without_timestamp_falls_back_to_cycle_count():
+    """老的 active-threads.json 没有时间戳字段，不能因此永远判不了冷场。"""
+    client = FakeClient({"p1": []})
+    mem = FakeMemory()
+    threads = {"p1": make_thread(idle_cycles=2)}  # 无 last_activity_at / opened_at
+    assert heartbeat._quiet_hours(threads["p1"]) is None
+
+    _, checked = heartbeat.follow_up_threads(
+        client, FakeBrain(None), mem, threads, dry_run=False
+    )
+    heartbeat._reap_cold_threads(mem, threads, checked)
+
+    assert threads["p1"]["closed"] is True
+
+
+def test_follow_up_refreshes_the_activity_timestamp():
+    """每次追问都要刷新时间戳，否则一场热闹的多轮对线会拿开局时间去判冷场。"""
+    client = FakeClient(
+        {"p1": [{"id": "r1", "author": {"name": "hypebot"}, "content": "接话"}]}
+    )
+    mem = FakeMemory()
+    threads = {"p1": make_thread(last_activity_at=_hours_ago(20))}
+
+    heartbeat.follow_up_threads(client, FakeBrain(a_decision()), mem, threads, dry_run=False)
+
+    assert heartbeat._quiet_hours(threads["p1"]) < 1
+
+
+# ---------- 评论额度 ----------
+
+
+def test_follow_up_stops_when_budget_is_gone():
+    """额度用完时不追问，也不能把这些回复吞掉——下轮还要接着答。"""
+    client = FakeClient(
+        {"p1": [{"id": "r1", "author": {"name": "hypebot"}, "content": "接话"}]}
+    )
+    mem = FakeMemory()
+    brain = FakeBrain(a_decision())
+    threads = {"p1": make_thread()}
+
+    handled, _ = heartbeat.follow_up_threads(
+        client, brain, mem, threads, dry_run=False, budget=_spent_budget(cap=0)
+    )
+
+    assert handled == 0
+    assert client.posted == []
+    assert brain.calls == []                      # 也没白花 API 钱
+    assert threads["p1"]["seen_reply_ids"] == []  # 回复留着，下轮再答
+    assert threads["p1"]["rounds"] == 1
+
+
+def test_follow_up_spends_one_unit_per_reply():
+    client = FakeClient(
+        {"p1": [{"id": "r1", "author": {"name": "hypebot"}, "content": "接话"}]}
+    )
+    mem = FakeMemory()
+    budget = _spent_budget(cap=5)
+    threads = {"p1": make_thread()}
+
+    heartbeat.follow_up_threads(
+        client, FakeBrain(a_decision()), mem, threads, dry_run=False, budget=budget
+    )
+
+    assert client.posted == [("p1", "你这是双标。")]
+    assert budget.used == 1
+
+
+def test_no_budget_means_no_feed_fetch_and_no_llm_spend():
+    """额度归零时连 feed 都不该拉——L2 深挖出来也发不出去，纯烧钱。"""
+    class ExplodingClient:
+        def get_feed(self, **kwargs):
+            raise AssertionError("额度为 0 时不该拉 feed")
+
+    engaged, restraint = heartbeat.open_new_battles(
+        ExplodingClient(),
+        FakeBrain(None),
+        FakeMemory(),
+        {},
+        max_new=3,
+        max_deliberate=4,
+        dry_run=False,
+        budget=_spent_budget(cap=0),
+    )
+
+    assert engaged == 0
+    assert restraint == []
+
+
+def test_cold_threshold_is_read_at_runtime_not_import_time(monkeypatch):
+    """阈值必须运行时读——.env 是 main() 里才加载的，导入时定死等于只认 export。"""
+    monkeypatch.setenv("MADTED_COLD_AFTER_HOURS", "3")
+    assert heartbeat.cold_after_hours() == 3.0
+
+    monkeypatch.setenv("MADTED_COLD_AFTER_HOURS", "半天")
+    assert heartbeat.cold_after_hours() == heartbeat.DEFAULT_COLD_AFTER_HOURS
+
+
+def test_lower_cold_threshold_lets_a_recent_thread_be_reaped():
+    """调低阈值就该更早判冷场——参数是真的接上了，不是摆设。"""
+    client = FakeClient({"p1": []})
+    mem = FakeMemory()
+    threads = {"p1": make_thread(idle_cycles=2, last_activity_at=_hours_ago(2))}
+
+    _, checked = heartbeat.follow_up_threads(
+        client, FakeBrain(None), mem, threads, dry_run=False
+    )
+    heartbeat._reap_cold_threads(mem, threads, checked, min_quiet_hours=1)
+
+    assert threads["p1"]["closed"] is True

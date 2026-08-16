@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import logging
 import sys
 from pathlib import Path
 from types import SimpleNamespace
@@ -121,6 +122,52 @@ def test_refusal_falls_back_to_l0_order():
 
     assert ranked[0].verdict is None
     assert ranked[0].combined_score == 9.0
+
+
+def test_truncation_is_logged_as_truncation(caplog):
+    """截断和"模型把 JSON 写歪了"是两种病，日志得分得开。
+
+    2026-08-16 连挂两轮就是栽在这儿：两种情况共用一句"解析失败"，
+    光看日志看不出该调上限还是该改 rubric。
+    """
+    cands = [_candidate(id="a", score=9.0)]
+    client = _FakeClient(
+        [
+            SimpleNamespace(
+                stop_reason="max_tokens",
+                parsed_output=None,
+                usage=SimpleNamespace(output_tokens=triage.MAX_TOKENS),
+            )
+        ]
+    )
+
+    with caplog.at_level(logging.WARNING, logger="triage"):
+        ranked = triage.Triage(client=client).rank(cands)
+
+    assert ranked[0].verdict is None  # 照常退回 L0，不中断整轮
+    assert "截断" in caplog.text
+    assert str(triage.MAX_TOKENS) in caplog.text
+
+
+def test_malformed_output_logs_stop_reason(caplog):
+    """没截断却解析不出来，得把 stop_reason 报出来才有下一步可查。"""
+    cands = [_candidate(id="a", score=9.0)]
+    client = _FakeClient([SimpleNamespace(stop_reason="end_turn", parsed_output=None)])
+
+    with caplog.at_level(logging.WARNING, logger="triage"):
+        triage.Triage(client=client).rank(cands)
+
+    assert "end_turn" in caplog.text
+    assert "截断" not in caplog.text
+
+
+def test_max_tokens_leaves_room_for_thinking():
+    """thinking 和正文共用 max_tokens，上限不能压到实测用量附近。
+
+    实测一批 12 条要 3756 输出 token（thinking 2959），BATCH_SIZE 是 25，
+    满批还要翻一倍。4096 就是这么被撞穿的。
+    """
+    assert triage.MAX_TOKENS >= 16384
 
 
 def test_out_of_range_indices_are_ignored():

@@ -10,8 +10,9 @@ L0（radar.py）判断的是"帖子长什么样"——有没有链接、赞评�
 rubric 的条目就是人设 §3 工具箱的结构化版本——每条论证缺陷对应一招。
 
 成本：Haiku 4.5 是 $1/$5 每百万 token。一次 heartbeat 扫 60 条帖子，
-分批送进来约 9K 输入 + 2.4K 输出 ≈ $0.02。每小时一轮的话一天约 $0.5，
-一个月约 $4。比让 Sonnet 去逐条判断"这条要不要杠"便宜两个数量级——
+L0 之后进来 10 出头，实测 5.2K 输入 + 3.8K 输出 ≈ $0.02（输出里 thinking
+占了大头，2959）。每小时一轮的话一天约 $0.5，一个月约 $4。
+比让 Sonnet 去逐条判断"这条要不要杠"便宜两个数量级——
 而且省钱不是重点，重点是让 L2 那几次贵的调用花在对的帖子上。
 """
 
@@ -33,7 +34,16 @@ log = logging.getLogger(__name__)
 DEFAULT_TRIAGE_MODEL = "claude-haiku-4-5"
 TRIAGE_MODEL = os.environ.get("MADTED_TRIAGE_MODEL", DEFAULT_TRIAGE_MODEL)
 
-MAX_TOKENS = 4096
+# thinking 和正文共用这一个上限。曾经设 4096，实测一批 12 条就要 3756
+# （其中 thinking 2959），只剩 8% 余量——模型稍微多想两句就撞上限，JSON
+# 截断，parsed_output 变 None，整批静默退回 L0 排序。2026-08-16 连续两轮
+# 都是这么挂的。
+#
+# 别指望 thinking 的 budget_tokens 兜底：上面那次声明的预算是 1024，实际
+# 生成了 2959。真正拦住截断的只有 max_tokens。
+#
+# 往大了设不花钱——max_tokens 是上限不是预付，只按实际生成的 token 计费。
+MAX_TOKENS = 16384
 
 # 一次送多少条进去。太多会让模型在长列表里偷懒（后面几条敷衍），
 # 太少则每批都要重付一遍 rubric 的输入 token。
@@ -144,6 +154,17 @@ def _format_batch(candidates: list[Candidate]) -> str:
     return "\n\n".join(blocks)
 
 
+def _output_tokens(response) -> str:
+    """从响应里掏出输出 token 数，掏不到就返回 '?'。
+
+    纯粹给日志用，所以一路 getattr 不抛异常——少打一个数字是小事，
+    为了一行诊断信息把整批候选拖崩了才是大事。
+    """
+    usage = getattr(response, "usage", None)
+    count = getattr(usage, "output_tokens", None)
+    return str(count) if count is not None else "?"
+
+
 class Triage:
     """L1 粗筛器。"""
 
@@ -186,7 +207,22 @@ class Triage:
             log.warning("L1 粗筛被模型拒绝，本批退回 L0 排序")
             return {}
         if response.parsed_output is None:
-            log.warning("L1 粗筛结构化输出解析失败，本批退回 L0 排序")
+            # 被截断（max_tokens）和模型真把 JSON 写歪了是两种病：前者调大
+            # 上限就好，后者得改 rubric。以前两种都只报一句"解析失败"，
+            # 结果连挂两轮也看不出该修哪儿——诊断信息比兜底逻辑更值钱。
+            if response.stop_reason == "max_tokens":
+                log.warning(
+                    "L1 粗筛输出被 max_tokens=%d 截断（本批 %d 条，已出 %s token），本批退回 L0 排序",
+                    MAX_TOKENS,
+                    len(candidates),
+                    _output_tokens(response),
+                )
+            else:
+                log.warning(
+                    "L1 粗筛结构化输出解析失败（stop_reason=%s，已出 %s token），本批退回 L0 排序",
+                    response.stop_reason,
+                    _output_tokens(response),
+                )
             return {}
 
         # 模型可能漏掉或编造 index，只认落在范围内的

@@ -27,7 +27,7 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
-from config import load_dotenv  # noqa: E402
+from config import force_utf8_stdio, load_dotenv  # noqa: E402
 
 # 依赖的最低版本，和 requirements.txt 保持一致
 REQUIRED_PACKAGES = [
@@ -439,6 +439,10 @@ def check_inbox(r: Report, client) -> None:
         return
 
     r.ok("Moltbook 收件箱", f"{len(activity)} 条待处理活动")
+
+
+def main() -> int:
+    force_utf8_stdio()
     parser = argparse.ArgumentParser(description="MadTed 上线前自检")
     parser.add_argument(
         "--skip-api", action="store_true", help="跳过 Anthropic / Moltbook 的网络检查"

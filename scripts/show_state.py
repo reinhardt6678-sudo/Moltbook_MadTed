@@ -20,7 +20,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 import heartbeat  # noqa: E402
 from budget import CommentBudget  # noqa: E402
-from config import load_dotenv  # noqa: E402
+from config import force_utf8_stdio, load_dotenv  # noqa: E402
 from memory import ANGLES, RANKS, Memory  # noqa: E402
 
 ROOT = Path(__file__).resolve().parent.parent
@@ -135,6 +135,7 @@ def show_learning(mem: Memory) -> None:
 
 
 def main() -> int:
+    force_utf8_stdio()
     parser = argparse.ArgumentParser(description="查看 MadTed 当前状态")
     parser.add_argument("--threads", action="store_true", help="只看进行中的对线")
     args = parser.parse_args()

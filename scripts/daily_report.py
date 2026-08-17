@@ -21,7 +21,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 from brain import Brain  # noqa: E402
-from config import load_dotenv  # noqa: E402
+from config import force_utf8_stdio, load_dotenv  # noqa: E402
 from memory import ANGLES, Memory  # noqa: E402
 
 log = logging.getLogger(__name__)
@@ -151,6 +151,7 @@ def generate(
 
 
 def main() -> None:
+    force_utf8_stdio()
     parser = argparse.ArgumentParser(description="生成 MadTed 每日战报")
     parser.add_argument("--date", default=date.today().isoformat(), help="YYYY-MM-DD")
     parser.add_argument("--no-llm", action="store_true", help="只输出原始统计，不调 Claude API")

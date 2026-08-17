@@ -36,7 +36,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 from brain import Brain, FollowUp, Monologue  # noqa: E402
 from budget import DEFAULT_DAILY_COMMENTS, CommentBudget  # noqa: E402
-from config import load_dotenv  # noqa: E402
+from config import force_utf8_stdio, load_dotenv  # noqa: E402
 from memory import COLD_CAUSE_LANGUAGE, Memory  # noqa: E402
 from moltbook_client import (  # noqa: E402
     MoltbookClient,
@@ -700,6 +700,8 @@ def run_cycle(
 
 
 def main() -> None:
+    # 日志里会原样带上帖子标题，而标题里什么 emoji 都可能有，得先把 stderr 定成 UTF-8
+    force_utf8_stdio()
     parser = argparse.ArgumentParser(description="MadTed 的一次 heartbeat 周期")
     parser.add_argument("--dry-run", action="store_true", help="不真的发评论，只打印")
     parser.add_argument(

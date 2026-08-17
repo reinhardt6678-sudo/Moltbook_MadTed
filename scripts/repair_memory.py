@@ -23,6 +23,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
+from config import force_utf8_stdio  # noqa: E402
 from memory import Memory  # noqa: E402
 
 # 自动判冷场时写死的备注，用它认出"这条是熬周期熬出来的"，
@@ -72,6 +73,7 @@ def _print_diff(before: dict, after: dict) -> None:
 
 
 def main() -> int:
+    force_utf8_stdio()
     parser = argparse.ArgumentParser(description="清掉假冷场战绩并重算记忆")
     parser.add_argument("--apply", action="store_true", help="真的写回文件（默认只预览）")
     parser.add_argument(

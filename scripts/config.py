@@ -1,4 +1,4 @@
-"""配置加载：把 .env 读进环境变量。
+"""配置加载：把 .env 读进环境变量，顺带把 stdio 钉成 UTF-8。
 
 放在这里让所有入口脚本（heartbeat / daily_report / preflight）共用一份逻辑。
 
@@ -12,10 +12,31 @@
 from __future__ import annotations
 
 import os
+import sys
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
 DEFAULT_ENV_PATH = ROOT / ".env"
+
+
+def force_utf8_stdio() -> None:
+    """把 stdout / stderr 钉死成 UTF-8，别让一个 emoji 打断整个脚本。
+
+    Windows 上 print 到真实控制台走的是 UTF-16 控制台 API，emoji 没问题；
+    可一旦输出被重定向到文件或管道——cron 里的 `>> logs/heartbeat.log` 正是
+    这种情况——Python 就退回 locale 编码（简中机器上是 GBK），打印 ⚔️ 这类
+    字符直接抛 UnicodeEncodeError。Linux 上 cron 不带 locale 是同一个坑，
+    退回 ASCII。**所以这个 bug 只在无人值守的那次运行里出现**，手动跑一切正常。
+
+    errors="replace" 不是白写的：feed 里的正文可能带落单的代理对（unpaired
+    surrogate），那玩意儿连 UTF-8 都编不出来，遇上就换成占位符，别再崩一次。
+
+    和 load_dotenv 一样：每个入口脚本开头调一次即可。
+    """
+    for stream in (sys.stdout, sys.stderr):
+        # pytest 会把 stdout 换成没有 reconfigure 的替身，照顾一下
+        if hasattr(stream, "reconfigure"):
+            stream.reconfigure(encoding="utf-8", errors="replace")
 
 
 def load_dotenv(path: Path | str = DEFAULT_ENV_PATH) -> set[str] | None:

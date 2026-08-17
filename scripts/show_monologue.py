@@ -21,6 +21,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
+from config import force_utf8_stdio  # noqa: E402
 from memory import ANGLES  # noqa: E402
 
 ROOT = Path(__file__).resolve().parent.parent
@@ -89,6 +90,7 @@ def _print_follow_up(e: dict) -> None:
 
 
 def main() -> int:
+    force_utf8_stdio()
     parser = argparse.ArgumentParser(description="查看 MadTed 的内心独白")
     parser.add_argument("--date", default=date.today().isoformat(), help="YYYY-MM-DD")
     parser.add_argument(

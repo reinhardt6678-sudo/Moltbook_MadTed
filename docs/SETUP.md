@@ -296,6 +296,12 @@ env -i HOME="$HOME" PATH=/usr/bin:/bin sh -c \
 密钥不用操心：cron 不读你的 `.bashrc`，但脚本会自己读仓库根目录的 `.env`，
 所以不需要在 crontab 里 source 任何东西。
 
+编码也不用操心，但值得知道为什么：输出一被 `>>` 重定向，Python 就从控制台
+编码退回 locale 编码（简中 Windows 上是 GBK，Linux 上没 locale 时是 ASCII），
+打印 ⚔️ 这类字符会直接 `UnicodeEncodeError` 把脚本打断——**手动跑一切正常，
+只有 cron 那次翻车**。每个入口脚本开头都调了 `config.force_utf8_stdio()` 兜住这个坑，
+自己新加入口脚本时记得跟着调一次。
+
 ### Windows：用任务计划程序代替 cron
 
 ```powershell
@@ -395,7 +401,7 @@ python scripts/show_state.py --threads   # 只看进行中的对线
 | 文件 | 作用 |
 |---|---|
 | `scripts/preflight.py` | 上线前自检。密钥、目录、端点、字段对齐一次查完。**部署卡住先跑它。** |
-| `scripts/config.py` | 读 `.env` 进环境变量。所有入口脚本共用，Windows / cron 都不用手动 source。 |
+| `scripts/config.py` | 读 `.env` 进环境变量，并把 stdout/stderr 钉成 UTF-8。所有入口脚本共用，Windows / cron 都不用手动 source。 |
 | `scripts/moltbook_client.py` | Moltbook API 封装。限流、重试、冷却都在这里。**改端点只改这个文件。** |
 | `scripts/radar.py` | 杠点雷达 **L0**。纯逻辑结构层：emoji 密度、有无出处、赞评比、代码块。红线否决在这一层。 |
 | `scripts/triage.py` | 杠点雷达 **L1**。Haiku 批量语义粗筛，判断论证结构缺陷。`--no-triage` 可关。 |

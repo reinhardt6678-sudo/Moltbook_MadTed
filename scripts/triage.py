@@ -40,14 +40,39 @@ TRIAGE_MODEL = os.environ.get("MADTED_TRIAGE_MODEL", DEFAULT_TRIAGE_MODEL)
 # 都是这么挂的。
 #
 # 别指望 thinking 的 budget_tokens 兜底：上面那次声明的预算是 1024，实际
-# 生成了 2959。真正拦住截断的只有 max_tokens。
+# 生成了 2959。2026-08-17 又量了两次，4 条 2449、8 条 4577，一次比一次离谱。
+# 真正拦住截断的只有 max_tokens。
 #
 # 往大了设不花钱——max_tokens 是上限不是预付，只按实际生成的 token 计费。
-MAX_TOKENS = 16384
+# 而且拦"跑飞"是 REQUEST_TIMEOUT 的活：按墙上时间掐比按 token 掐准得多，
+# 毕竟正常一批也要好几千 token。这个上限只需要离**正常用量**足够远，
+# 留一倍余量（见 tests 里那条 batch_size 与 max_tokens 的一致性检查）。
+MAX_TOKENS = 32768
 
 # 一次送多少条进去。太多会让模型在长列表里偷懒（后面几条敷衍），
 # 太少则每批都要重付一遍 rubric 的输入 token。
-BATCH_SIZE = 25
+#
+# 上限还得和 MAX_TOKENS 对得上。实测 thinking 的消耗基本随帖子数线性增长
+# （4 条 2449、8 条 4577，约 590/条），JSON 本身约 105/条：
+#
+#     25 条 ≈ 14700 thinking + 2600 JSON ≈ 17K  > 老的 16384 上限 ✗
+#     12 条 ≈  7100 thinking + 1300 JSON ≈  8K
+#
+# 也就是说 25 这个批次不需要模型"跑飞"，正常发挥就会撞上限——只要哪轮
+# L0 放过来 20 条以上，整批就静默退回 L0 排序。多付一遍 rubric 的输入
+# token（Haiku 输入 $1/M，约 $0.001）比这个便宜太多了。
+#
+# 批次还得小到让**正常**一批稳稳跑完 REQUEST_TIMEOUT：实测 8 条 50 秒、
+# 12 条 40 秒，而 25 条按这个速率要两分多钟——那样超时就该误伤好批次了。
+BATCH_SIZE = 12
+
+# 单次请求超时。SDK 默认读超时 600 秒，而且默认还会重试 2 次——一次跑飞
+# 能占住半小时，定时器却是每小时一轮。2026-08-17 实测过一次：4 条候选的
+# 一批，thinking 一路转到 16384 撞上限，光这一个调用就耗了 9 分 44 秒。
+#
+# 正常一批（12 条）在 50 秒上下，给到 120 秒既不会误伤，也把失控的损失
+# 从"占住整轮"压回"这批退回 L0"。
+REQUEST_TIMEOUT = 120.0
 
 # 注意：**不要给 rubric 加 cache_control**。Haiku 4.5 的最小可缓存前缀是
 # 4096 token，这份 rubric 一千出头，加了也不会缓存——而且是静默不缓存
@@ -186,10 +211,17 @@ class Triage:
                     }
                 ],
                 output_format=TriageBatch,
+                timeout=REQUEST_TIMEOUT,
                 **tuning_params(self.model, self.effort),
             )
         except anthropic.APIStatusError as exc:
             log.error("L1 粗筛调用失败 (%s): %s", exc.status_code, exc.message)
+            return {}
+        except anthropic.APIConnectionError as exc:
+            # 超时（APITimeoutError）也走这条。以前它根本没被接住——
+            # APITimeoutError 不是 APIStatusError 的子类，一超时直接掀桌，
+            # 整轮 heartbeat 连跟进阶段的成果都一起赔进去。
+            log.warning("L1 粗筛连接失败（%s），本批退回 L0 排序", type(exc).__name__)
             return {}
 
         if response.stop_reason == "refusal":

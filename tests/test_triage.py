@@ -96,6 +96,34 @@ def test_batches_are_chunked():
     assert len(client.messages.calls) == 3
 
 
+def test_timeout_falls_back_instead_of_taking_down_the_cycle():
+    """核心回归：超时以前根本没被接住。
+
+    APITimeoutError 不是 APIStatusError 的子类，所以 except 分支漏掉了它，
+    一超时就把整轮 heartbeat 掀了——连跟进阶段已经发出去的追问都白跑。
+    """
+    cands = [_candidate(id="a", score=3.0), _candidate(id="b", score=9.0)]
+    error = anthropic.APITimeoutError(
+        request=httpx.Request("POST", "https://api.anthropic.com/v1/messages")
+    )
+    client = _FakeClient([error])
+
+    ranked = triage.Triage(client=client).rank(cands)
+
+    assert [s.candidate.post_id for s in ranked] == ["b", "a"]
+    assert all(s.verdict is None for s in ranked)
+
+
+def test_request_carries_an_explicit_timeout():
+    """SDK 默认读超时 600 秒还自带 2 次重试——一次跑飞能占住半小时。"""
+    client = _FakeClient([_ok([_verdict(0)])])
+
+    triage.Triage(client=client).rank([_candidate(id="a")])
+
+    assert client.messages.calls[0]["timeout"] == triage.REQUEST_TIMEOUT
+    assert triage.REQUEST_TIMEOUT <= 300
+
+
 def test_api_failure_falls_back_to_l0_order():
     """粗筛挂了不能拖垮整轮 heartbeat，退化成 L0 排序继续走。"""
     cands = [_candidate(id="a", score=3.0), _candidate(id="b", score=9.0)]
@@ -164,10 +192,29 @@ def test_malformed_output_logs_stop_reason(caplog):
 def test_max_tokens_leaves_room_for_thinking():
     """thinking 和正文共用 max_tokens，上限不能压到实测用量附近。
 
-    实测一批 12 条要 3756 输出 token（thinking 2959），BATCH_SIZE 是 25，
-    满批还要翻一倍。4096 就是这么被撞穿的。
+    实测一批 12 条要 3756 输出 token（thinking 2959）。4096 就是这么被撞穿的。
     """
     assert triage.MAX_TOKENS >= 16384
+
+
+# 2026-08-17 实测（Haiku 4.5，effort=low）：thinking 4 条 2449、8 条 4577，
+# 约 590/条；JSON 正文 8 条 853，约 105/条。基本随帖子数线性增长。
+OBSERVED_OUTPUT_TOKENS_PER_POST = 695
+
+
+def test_batch_size_cannot_outgrow_max_tokens():
+    """满批的实测用量必须离上限有一半余量。
+
+    这两个常数是一对，改哪个都得回头看另一个：BATCH_SIZE 曾经是 25，
+    满批 ≈ 17K 已经超过 16384——不需要模型跑飞，只要 L0 那轮多放几条过来，
+    整批就撞上限静默退回 L0 排序，而 L0 是看不懂内容的。
+    """
+    worst_case = triage.BATCH_SIZE * OBSERVED_OUTPUT_TOKENS_PER_POST
+
+    assert worst_case * 2 <= triage.MAX_TOKENS, (
+        f"满批 {triage.BATCH_SIZE} 条实测约需 {worst_case} token，"
+        f"上限 {triage.MAX_TOKENS} 余量不足一倍"
+    )
 
 
 def test_out_of_range_indices_are_ignored():

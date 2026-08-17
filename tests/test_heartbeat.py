@@ -15,7 +15,7 @@ import pytest
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "scripts"))
 
 import heartbeat  # noqa: E402
-from brain import FollowUp  # noqa: E402
+from brain import FollowUp, Monologue  # noqa: E402
 from budget import CommentBudget  # noqa: E402
 from moltbook_client import (  # noqa: E402
     MoltbookError,
@@ -29,12 +29,16 @@ from moltbook_client import (  # noqa: E402
 class FakeClient:
     """假客户端：可以指定评论区内容，以及通知端点是否可用。"""
 
-    def __init__(self, replies=None, *, notifications_fail=False, replies_fail=False):
+    def __init__(self, replies=None, *, notifications_fail=False, replies_fail=False, feed=None):
         self._replies = replies or {}
+        self._feed = feed or []
         self.notifications_fail = notifications_fail
         self.replies_fail = replies_fail
         self.posted: list[tuple[str, str]] = []
         self.marked_read: list[str] = []
+
+    def get_feed(self, **kwargs):
+        return list(self._feed)
 
     def get_agent_status(self):
         return {"name": "MadTed"}
@@ -60,23 +64,33 @@ class FakeClient:
 class FakeBrain:
     """假大脑：按预设返回决策，None 表示这轮没给出结果。"""
 
-    def __init__(self, decision: FollowUp | None):
+    def __init__(self, decision: FollowUp | None, monologue: Monologue | None = None):
         self.decision = decision
+        self.monologue = monologue
         self.calls: list[str] = []
 
     def follow_up(self, transcript, used_angles, **kwargs):
         self.calls.append(transcript)
         return self.decision
 
+    def deliberate(self, post_text, skipped_summaries, **kwargs):
+        self.calls.append(post_text)
+        return self.monologue
+
 
 class FakeMemory:
     def __init__(self):
         self.battles: list[dict] = []
+        self.truce_list: list[str] = []
+        self.low_yield_topics: list[str] = []
 
     def angle_preference(self):
         return ([], [], None)
 
     def opponent_profile(self, name):
+        return {}
+
+    def signal_bias(self):
         return {}
 
     def record_battle(self, **kwargs):
@@ -126,6 +140,36 @@ def a_decision(**overrides) -> FollowUp:
     }
     payload.update(overrides)
     return FollowUp(**payload)
+
+
+def a_monologue(**overrides) -> Monologue:
+    payload = {
+        "scanned": "《Agents will completely replace human QA teams》—— @hypebot",
+        "first_reaction": "又来了",
+        "weak_points": "completely / every single 都是全称断言",
+        "verdict": "出手",
+        "why_this_one": "刚划走的两条都没这么绝对",
+        "angle": "3.2",
+        "angle_reason": "举个反例最快",
+        "prediction": "他会退到'大部分'",
+        "reply": "Which teams, and how did you count them?",
+    }
+    payload.update(overrides)
+    return Monologue(**payload)
+
+
+def a_post(**overrides) -> dict:
+    post = {
+        "id": "p9",
+        "title": "Agents will completely replace human QA teams",
+        "content": "Every single team I know has already switched. "
+                   "This is inevitable and nobody should argue.",
+        "author": {"name": "hypebot"},
+        "upvotes": 30,
+        "comment_count": 2,
+    }
+    post.update(overrides)
+    return post
 
 
 @pytest.fixture(autouse=True)
@@ -543,3 +587,87 @@ def test_lower_cold_threshold_lets_a_recent_thread_be_reaped():
     heartbeat._reap_cold_threads(mem, threads, checked, min_quiet_hours=1)
 
     assert threads["p1"]["closed"] is True
+
+
+# ---------- 残次品不许出门（截断后的输出） ----------
+
+
+def test_truncated_follow_up_is_not_posted_and_the_reply_waits_for_next_round():
+    """回复塌成占位符时，这轮什么都别做——但**不能**把对方的回复吞掉。
+
+    吞掉了下轮就看不见它，这串会以 rounds=1 熬到冷场，
+    最后 agent 学到的是"这个角度没人接"，而真相是它自己没说出话来。
+    """
+    client = FakeClient(
+        {"p1": [{"id": "r1", "author": {"name": "hypebot"}, "content": "接话"}]}
+    )
+    mem = FakeMemory()
+    budget = _spent_budget(cap=5)
+    threads = {"p1": make_thread()}
+
+    handled, _ = heartbeat.follow_up_threads(
+        client,
+        FakeBrain(a_decision(reply="x")),
+        mem,
+        threads,
+        dry_run=False,
+        budget=budget,
+    )
+
+    assert handled == 0
+    assert client.posted == []
+    assert budget.used == 0
+    assert threads["p1"]["seen_reply_ids"] == []
+    assert threads["p1"]["rounds"] == 1
+
+
+def test_truncated_new_battle_is_not_posted():
+    """判定出手但回复是残次品：不发、不扣额度、不开讨论串。
+
+    2026-08-13 的真实事故——一条正文只有 'x' 的评论发到了 @vina 帖子下。
+    """
+    client = FakeClient(feed=[a_post()])
+    mem = FakeMemory()
+    budget = _spent_budget(cap=5)
+    threads: dict = {}
+
+    engaged, restraint = heartbeat.open_new_battles(
+        client,
+        FakeBrain(None, a_monologue(reply="x")),
+        mem,
+        threads,
+        max_new=1,
+        max_deliberate=4,
+        dry_run=False,
+        budget=budget,
+    )
+
+    assert engaged == 0
+    assert client.posted == []
+    assert budget.used == 0
+    assert threads == {}
+    # 也不算「忍住了」——那是主动放弃的计数，残次品混进去等于把 bug 记成美德
+    assert restraint == []
+
+
+def test_a_complete_new_battle_still_goes_out():
+    """把关不能把正常的出手也拦下来。"""
+    client = FakeClient(feed=[a_post()])
+    budget = _spent_budget(cap=5)
+    threads: dict = {}
+
+    engaged, _ = heartbeat.open_new_battles(
+        client,
+        FakeBrain(None, a_monologue()),
+        FakeMemory(),
+        threads,
+        max_new=1,
+        max_deliberate=4,
+        dry_run=False,
+        budget=budget,
+    )
+
+    assert engaged == 1
+    assert client.posted == [("p9", "Which teams, and how did you count them?")]
+    assert budget.used == 1
+    assert threads["p9"]["rounds"] == 1

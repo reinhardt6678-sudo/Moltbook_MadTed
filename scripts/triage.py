@@ -25,7 +25,7 @@ from typing import Literal
 import anthropic
 from pydantic import BaseModel, Field
 
-from brain import tuning_params
+from brain import output_tokens, tuning_params
 from radar import Candidate
 
 log = logging.getLogger(__name__)
@@ -154,17 +154,6 @@ def _format_batch(candidates: list[Candidate]) -> str:
     return "\n\n".join(blocks)
 
 
-def _output_tokens(response) -> str:
-    """从响应里掏出输出 token 数，掏不到就返回 '?'。
-
-    纯粹给日志用，所以一路 getattr 不抛异常——少打一个数字是小事，
-    为了一行诊断信息把整批候选拖崩了才是大事。
-    """
-    usage = getattr(response, "usage", None)
-    count = getattr(usage, "output_tokens", None)
-    return str(count) if count is not None else "?"
-
-
 class Triage:
     """L1 粗筛器。"""
 
@@ -215,13 +204,13 @@ class Triage:
                     "L1 粗筛输出被 max_tokens=%d 截断（本批 %d 条，已出 %s token），本批退回 L0 排序",
                     MAX_TOKENS,
                     len(candidates),
-                    _output_tokens(response),
+                    output_tokens(response),
                 )
             else:
                 log.warning(
                     "L1 粗筛结构化输出解析失败（stop_reason=%s，已出 %s token），本批退回 L0 排序",
                     response.stop_reason,
-                    _output_tokens(response),
+                    output_tokens(response),
                 )
             return {}
 

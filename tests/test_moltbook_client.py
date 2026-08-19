@@ -173,3 +173,56 @@ def test_dry_run_does_not_remember_paths():
     client = MoltbookClient("", dry_run=True)
     client.create_comment("p1", "内容")
     assert client._resolved == {}
+
+
+def test_get_replies_flattens_nested_comments(client):
+    """子回复裹在父评论的 replies 里，只取顶层等于把所有冲我来的回复都漏掉。
+
+    线上表现：对手在楼里回了三条、其中一条直接回我，agent 一条都没读到，
+    最后把这串记成"对方停止回应，收尾"。
+    """
+    def fake(method, path, *, params=None, json=None, max_retries=4):
+        return {
+            "success": True,
+            "count": 3,
+            "comments": [
+                {
+                    "id": "c1",
+                    "content": "顶层",
+                    "replies": [
+                        {"id": "c2", "content": "回 c1", "parent_id": "c1",
+                         "replies": [{"id": "c3", "content": "回 c2"}]}
+                    ],
+                }
+            ],
+        }
+
+    client._request = fake
+    got = client.get_replies("p1")
+
+    assert [c["id"] for c in got] == ["c1", "c2", "c3"]
+    # 服务端没给 parent_id 的，按树结构补上——摊平之后这是唯一还能分辨回谁的东西
+    assert got[2]["parent_id"] == "c2"
+    # 摊平之后不再拖着整棵子树
+    assert "replies" not in got[1]
+
+
+def test_create_comment_unwraps_the_envelope(client):
+    """POST 的返回体裹了一层信封，不解掉就拿不到自己的评论 id。"""
+    from moltbook_client import comment_id
+
+    def fake(method, path, *, params=None, json=None, max_retries=4):
+        return {"success": True, "comment": {"id": "my-comment", "content": "x"}}
+
+    client._request = fake
+
+    assert comment_id(client.create_comment("p1", "x")) == "my-comment"
+
+
+def test_agent_self_name_reads_nested_agent():
+    """/agents/status 把名字放在 agent 子对象里。"""
+    from moltbook_client import agent_self_name
+
+    assert agent_self_name({"agent": {"name": "madted"}}) == "madted"
+    assert agent_self_name({"name": "madted"}) == "madted"
+    assert agent_self_name({"success": True}) == ""

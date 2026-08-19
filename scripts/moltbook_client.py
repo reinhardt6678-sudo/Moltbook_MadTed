@@ -221,7 +221,12 @@ class MoltbookClient:
         return _unwrap_list(data, "posts")
 
     def get_replies(self, post_id: str, *, limit: int = 100) -> list[dict]:
-        """拉取某个帖子下的回复。"""
+        """拉取某个帖子下的回复，**连嵌套的子回复一起**摊平返回。
+
+        端点只返回顶层评论，子回复裹在各自父评论的 `replies` 里。别人回我
+        一定是挂在我那条评论下面（depth≥1），所以只读顶层那批
+        等于把所有真正冲我来的回复全漏掉——见 flatten_comments。
+        """
         data = self._try_paths(
             "GET",
             [
@@ -231,7 +236,7 @@ class MoltbookClient:
             cache_key="get_replies",
             params={"limit": limit},
         )
-        return _unwrap_list(data, "comments", "replies")
+        return flatten_comments(_unwrap_list(data, "comments", "replies"))
 
     def get_home(self) -> dict:
         """首页看板。官方文档（HEARTBEAT.md）里发现『有人回复你』的正门：
@@ -309,7 +314,9 @@ class MoltbookClient:
             cache_key="create_comment",
         )
         self._throttle.mark("comment")
-        return result or {}
+        # 解掉信封再返回：调用方要拿里面的评论 id 记住"这条是我说的"，
+        # 拿不到的话就认不出自己，后面判不出谁在回我。
+        return _unwrap_obj(result, "comment", "reply")
 
     def create_post(self, *, submolt: str, title: str, content: str) -> dict:
         """发帖。受 post_cooldown 限制（约 30 分钟一帖）。"""
@@ -375,6 +382,57 @@ def parent_comment_id(comment: dict) -> str:
     return ""
 
 
+def flatten_comments(items: Any) -> list[dict]:
+    """把嵌套的评论树摊平成一条一条的评论。
+
+    评论区是有层级的（线上见过 5 层深），子回复裹在父评论的 `replies` 里，
+    端点本身只返回顶层那批。**别人回我一定是挂在我那条评论下面**，也就是
+    depth≥1——只读顶层等于把所有冲我来的回复都留在视野之外。线上表现是
+    对手在楼里回了三条、其中一条直接回我，agent 一条没读到，
+    最后把这串记成"对方停止回应，收尾"。
+
+    父子关系优先信服务端给的 parent_id，缺了就按树结构补：摊平之后
+    这个字段是唯一还能分辨"这条回的是谁"的东西。
+    """
+    flat: list[dict] = []
+
+    def walk(nodes: Any, parent: str) -> None:
+        if not isinstance(nodes, list):
+            return
+        for node in nodes:
+            if not isinstance(node, dict):
+                continue
+            item = {key: value for key, value in node.items() if key != "replies"}
+            if parent and not parent_comment_id(item):
+                item["parent_id"] = parent
+            flat.append(item)
+            walk(node.get("replies"), comment_id(item) or parent)
+
+    walk(items, "")
+    return flat
+
+
+def agent_self_name(status: dict) -> str:
+    """从 /agents/status 的返回体里取自己的名字。
+
+    名字在嵌套的 agent 对象里（`{"success": true, "agent": {"name": …}}`），
+    以前只读顶层的 name/username，拿到的永远是空字符串——认不出自己，
+    就分不清评论区里哪条是自己说的、哪条是冲自己来的。
+    """
+    if not isinstance(status, dict):
+        return ""
+    direct = _first_str(status, ("name", "username", "handle", "agent_name"))
+    if direct:
+        return direct
+    for key in ("agent", "me", "profile", "data"):
+        nested = status.get(key)
+        if isinstance(nested, dict):
+            found = _first_str(nested, ("name", "username", "handle", "agent_name"))
+            if found:
+                return found
+    return ""
+
+
 def notification_post_id(notification: dict) -> str:
     """通知指向哪个帖子。取不到就返回空——调用方应当忽略，不要当成 '所有帖子'。"""
     direct = _first_str(
@@ -409,3 +467,21 @@ def _unwrap_list(data: Any, *keys: str) -> list[dict]:
                 return value
     log.warning("无法从响应中解析出列表：%s", str(data)[:200])
     return []
+
+
+def _unwrap_obj(data: Any, *keys: str) -> dict:
+    """写操作的返回体解信封。
+
+    读的那条路一直有 _unwrap_list 解 `{"comments": [...]}`，写的这条没有：
+    POST 完评论返回的是 `{"success": true, "comment": {...}}`，
+    顶层没有 id，于是 `own_comment_ids` 永远存不进东西。
+    """
+    if not isinstance(data, dict):
+        return {}
+    if _first_str(data, ("id", "comment_id", "commentId", "_id")):
+        return data
+    for candidate in (*keys, "data", "result"):
+        value = data.get(candidate)
+        if isinstance(value, dict):
+            return value
+    return data

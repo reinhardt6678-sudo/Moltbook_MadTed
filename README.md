@@ -18,7 +18,7 @@
 ```bash
 pip install -r requirements.txt
 cp .env.example .env          # 填 MOLTBOOK_API_KEY 和 ANTHROPIC_API_KEY
-python -m pytest tests/ -q    # 213 个测试，不需要任何 key
+python -m pytest tests/ -q    # 228 个测试，不需要任何 key
 python scripts/preflight.py   # 上线前自检：密钥、端点、目录一次查完
 python scripts/heartbeat.py --dry-run              # 空跑，不真的发帖
 ```
@@ -58,10 +58,16 @@ python scripts/heartbeat.py --dry-run              # 空跑，不真的发帖
 
 反过来，能扛住 4 轮以上还能把你问住的「硬骨头」要**加权优先找**——那才是 MadTed 真正想要的对手。
 
-判冷场有个前提：**必须真的去评论区看过**。跟进阶段每轮直接轮询各讨论串的
+判冷场有个前提：**必须真的去评论区看过，而且看全**。跟进阶段每轮直接轮询各讨论串的
 `GET /posts/{id}/comments`，收件箱（`/home` 的 `activity_on_your_posts`）只用来
 决定先看谁。拉取失败的那一轮不计入闲置——"我没看见"和"没人理我"是两回事，
 把前者当后者，一次接口故障就能让好角度进「钝刀」、正常对手进「免战名单」。
+
+"看全"是字面意思：评论区是**有层级的**（线上见过 5 层深），端点只返回顶层那批，
+子回复裹在各自父评论的 `replies` 里。而别人回你一定是挂在你那条评论下面——
+只读顶层，等于把所有真回复都留在视野之外，同时把楼里旁人的顶层发言
+当成"对方回我了"。判"这条是不是冲我来的"要沿 `parent_id` 一路上溯到自己那条评论，
+或者认正文里的 `@我`；其余的是旁人在楼里自己聊，不触发追问，也不清零闲置计数。
 
 ### 📊 每日战报
 
@@ -125,11 +131,11 @@ python scripts/heartbeat.py --dry-run              # 空跑，不真的发帖
 | `scripts/memory.py` | 记忆与学习。杠力值、冷场五类归因、免战名单、角度统计、跨语言的结构信号权重。 |
 | `scripts/brain.py` | 调 Claude 生成内心独白与回复。人设文档在这里当 system prompt（带 prompt caching）。 |
 | `scripts/heartbeat.py` | 主流程：先跟进老讨论串 → 再开新杠 → 更新记忆。 |
-| `scripts/repair_memory.py` | 一次性维护：清掉跟进阶段瞎掉那阵子留下的假冷场战绩，并重算派生名单。`--rebuild` 一条战绩都不删，只按新口径重放一遍——**改了统计口径之后要跑它**，否则旧账一直留着。 |
+| `scripts/repair_memory.py` | 一次性维护：清掉读不到回复那阵子留下的假战绩（`冷场` 和 `一轮即止/对方停止回应` 两批），并重算派生名单。`--rebuild` 一条战绩都不删，只按新口径重放一遍——**改了统计口径之后要跑它**；`--prune-turns` 清掉对线记录里混进来的旁人发言。 |
 | `scripts/daily_report.py` | 每日战报。`--no-llm` 可只看原始统计。 |
 | `scripts/show_monologue.py` | 按人设格式打印当天内心独白。**想知道它为什么挑这条帖子就看这个。** |
 | `scripts/show_state.py` | 杠力值、进行中的对线、学到的东西。**Windows 上别直接 `type` json，会乱码。** |
-| `tests/` | 213 个单元测试，中英文样本都覆盖，纯逻辑不需要 key。 |
+| `tests/` | 228 个单元测试，中英文样本都覆盖，纯逻辑不需要 key。 |
 
 ```
 personas/contrarian-agent.md   # 人设 = system prompt
@@ -156,6 +162,8 @@ reports/daily/*.md             # （运行时生成）每日战报
 > ⚠️ `moltbook.com` 在开发环境中无法直接访问，`moltbook_client.py` 的端点部分整理自公开教程和第三方 SDK，部分对齐了 [HEARTBEAT.md](HEARTBEAT.md)（平台自己给的接入说明）。首次接入请对照 [官方开发者文档](https://www.moltbook.com/developers) 核实，端点全部集中在一个文件里，改起来很快。
 >
 > 教训：曾经有过一版跟进逻辑只认一个没写进官方文档的 `/notifications`，它 404 之后 agent 一条回复都看不见，日报上却是一串"冷场"。**读不到 ≠ 没人理**，这两件事在代码里必须分开。
+>
+> 同一个毛病换了张皮又犯了一次：管道通了，但 reader 只取顶层评论，而真回复都在 depth≥1。这次的账更难看——一边把对手实打实的三条回复记成"对方停止回应"，一边拿楼里旁人的闲聊当"有人回我了"去追问。**读全了才算读到**，而且**旁人说话 ≠ 对方回我**。
 
 ---
 

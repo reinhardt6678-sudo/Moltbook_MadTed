@@ -7,6 +7,7 @@
 from __future__ import annotations
 
 import json
+import re
 from collections import Counter
 from datetime import date, datetime, timezone
 from pathlib import Path
@@ -67,6 +68,23 @@ COLD_CAUSES = ("对象型", "话题型", "角度型", "姿态型", COLD_CAUSE_LA
 # 而"'其实吧'这个词是好钩子"换成英文 feed 就一文不值。
 SIGNAL_MIN_SAMPLES = 6
 
+# 一次出手报了两招时的分隔符。schema 里 angle 写的是单个编号，
+# 但模型偶尔会写成 "3.10+3.4"。
+_ANGLE_SEPARATORS = re.compile(r"[+＋、,，/]")
+
+
+def split_angles(angle: str) -> list[str]:
+    """把 "3.10+3.4" 这种复合角度拆成单招。
+
+    整串当一个 key 记下来的话，热力图那 35% 的分母里会多出一个谁也不认识
+    的桶（`show_state.py` 显示成"未知招式"），3.10 和 3.4 各自的占比反而被
+    它稀释——而"逼着换招"这件事就是靠这个百分比转的，统计口径歪了，
+    禁用令就会晚来或者不来。
+
+    "none" 不是招式，是"这轮没用招"，不该占分母。
+    """
+    parts = (p.strip() for p in _ANGLE_SEPARATORS.split(angle or ""))
+    return [p for p in parts if p and p != "none"]
 
 
 def _empty_memory() -> dict[str, Any]:
@@ -234,10 +252,14 @@ class Memory:
         state["next_rank_at"] = next_at
 
     def _update_angle_stats(self, angle: str, *, effective: bool) -> None:
-        stats = self.data["angle_stats"].setdefault(angle, {"used": 0, "effective": 0})
-        stats["used"] += 1
-        if effective:
-            stats["effective"] += 1
+        angles = split_angles(angle)
+        if not angles:
+            return
+        for one in angles:
+            stats = self.data["angle_stats"].setdefault(one, {"used": 0, "effective": 0})
+            stats["used"] += 1
+            if effective:
+                stats["effective"] += 1
         self._refresh_sharp_blunt()
         self._maybe_ban_overused_angle()
 
@@ -392,10 +414,10 @@ class Memory:
         if not history:
             return {}
         effective_angles = Counter(
-            b["angle_used"] for b in history if b["rounds"] >= 2
+            a for b in history if b["rounds"] >= 2 for a in split_angles(b["angle_used"])
         )
         dead_angles = Counter(
-            b["angle_used"] for b in history if b["outcome"] == "冷场"
+            a for b in history if b["outcome"] == "冷场" for a in split_angles(b["angle_used"])
         )
         return {
             "name": name,

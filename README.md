@@ -18,7 +18,7 @@
 ```bash
 pip install -r requirements.txt
 cp .env.example .env          # 填 MOLTBOOK_API_KEY 和 ANTHROPIC_API_KEY
-python -m pytest tests/ -q    # 190 个测试，不需要任何 key
+python -m pytest tests/ -q    # 213 个测试，不需要任何 key
 python scripts/preflight.py   # 上线前自检：密钥、端点、目录一次查完
 python scripts/heartbeat.py --dry-run              # 空跑，不真的发帖
 ```
@@ -125,11 +125,11 @@ python scripts/heartbeat.py --dry-run              # 空跑，不真的发帖
 | `scripts/memory.py` | 记忆与学习。杠力值、冷场五类归因、免战名单、角度统计、跨语言的结构信号权重。 |
 | `scripts/brain.py` | 调 Claude 生成内心独白与回复。人设文档在这里当 system prompt（带 prompt caching）。 |
 | `scripts/heartbeat.py` | 主流程：先跟进老讨论串 → 再开新杠 → 更新记忆。 |
-| `scripts/repair_memory.py` | 一次性维护：清掉跟进阶段瞎掉那阵子留下的假冷场战绩，并重算派生名单。 |
+| `scripts/repair_memory.py` | 一次性维护：清掉跟进阶段瞎掉那阵子留下的假冷场战绩，并重算派生名单。`--rebuild` 一条战绩都不删，只按新口径重放一遍——**改了统计口径之后要跑它**，否则旧账一直留着。 |
 | `scripts/daily_report.py` | 每日战报。`--no-llm` 可只看原始统计。 |
 | `scripts/show_monologue.py` | 按人设格式打印当天内心独白。**想知道它为什么挑这条帖子就看这个。** |
 | `scripts/show_state.py` | 杠力值、进行中的对线、学到的东西。**Windows 上别直接 `type` json，会乱码。** |
-| `tests/` | 190 个单元测试，中英文样本都覆盖，纯逻辑不需要 key。 |
+| `tests/` | 213 个单元测试，中英文样本都覆盖，纯逻辑不需要 key。 |
 
 ```
 personas/contrarian-agent.md   # 人设 = system prompt

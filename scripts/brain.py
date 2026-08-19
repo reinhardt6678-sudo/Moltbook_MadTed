@@ -22,7 +22,21 @@ log = logging.getLogger(__name__)
 DEFAULT_MODEL = "claude-sonnet-5"
 MODEL = os.environ.get("MADTED_MODEL", DEFAULT_MODEL)
 
-MAX_TOKENS = 4096
+# thinking 和正文共用这一个上限，和 triage.py 是同一个坑，但症状更阴：
+# 那边截断会让 parsed_output 变 None（批量 schema 是个列表，断了就不合法），
+# 这边的 schema 全是必填字段，模型撞上限时会把剩下的草草收口——独白停在
+# 半句话上（`…inherit-forever太粗',这个`），后面的字段塌成 'x'。JSON 合法、
+# parsed_output 有值，一路顺到 create_comment：2026-08-13 就这么往 @vina
+# 帖子下发了一条正文只有 `x` 的评论，对方当然不理，然后这次沉默还被记成了
+# 正常的「一轮即止」，给角度 3.4 记了一次有效使用。
+#
+# 往大了设不花钱——max_tokens 是上限不是预付，只按实际生成的 token 计费。
+MAX_TOKENS = 16384
+
+# 发出去之前的最后一道网。门槛压得很低：只拦占位符，不评判质量——
+# 中文一句"你这是双标。"也是正经回复，长度在这儿说明不了任何事。
+# 真正防截断的是 _parse 里的 stop_reason 检查，这里只负责别让残次品出门。
+MIN_REPLY_CHARS = 4
 
 # 这些模型不认 adaptive thinking 和 effort，得用旧的 budget_tokens 写法。
 # 参数传错会直接 400，所以按模型分两套拼。
@@ -48,6 +62,22 @@ LANGUAGE_RULE = """
   "Which of those two claims are you actually making?" 这类钩子，
   短句、直给、结尾留个问号让对方自己填空。
 """
+
+
+def is_usable_reply(reply: str) -> bool:
+    """这条 reply 值不值得发出去。见 MIN_REPLY_CHARS 的说明。"""
+    return len(reply.strip()) >= MIN_REPLY_CHARS
+
+
+def output_tokens(response) -> str:
+    """从响应里掏出输出 token 数，掏不到就返回 '?'。
+
+    纯粹给日志用，所以一路 getattr 不抛异常——少打一个数字是小事，
+    为了一行诊断信息把整轮 heartbeat 拖崩了才是大事。
+    """
+    usage = getattr(response, "usage", None)
+    count = getattr(usage, "output_tokens", None)
+    return str(count) if count is not None else "?"
 
 
 def tuning_params(model: str, effort: str) -> dict:
@@ -203,8 +233,22 @@ class Brain:
         if response.stop_reason == "refusal":
             log.warning("模型拒绝了这个请求，跳过该帖")
             return None
+        # 截断必须在 parsed_output 之前查：这套 schema 断了照样能解析出对象，
+        # 只是内容是半截的（见 MAX_TOKENS 上面那段）。stop_reason 是唯一的实话，
+        # 拿一个半截的决定去发评论，比这轮什么都不发糟糕得多。
+        if response.stop_reason == "max_tokens":
+            log.warning(
+                "输出被 max_tokens=%d 截断（已出 %s token），本次决定作废",
+                MAX_TOKENS,
+                output_tokens(response),
+            )
+            return None
         if response.parsed_output is None:
-            log.warning("结构化输出解析失败，跳过")
+            log.warning(
+                "结构化输出解析失败（stop_reason=%s，已出 %s token），跳过",
+                response.stop_reason,
+                output_tokens(response),
+            )
             return None
         return response.parsed_output
 

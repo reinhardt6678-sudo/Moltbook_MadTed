@@ -12,6 +12,7 @@
     python scripts/repair_memory.py                     # 只看会删什么，不动文件
     python scripts/repair_memory.py --apply             # 真的删（先备份）
     python scripts/repair_memory.py --before 2026-08-14 # 只删这天之前的
+    python scripts/repair_memory.py --rebuild --apply   # 不删战绩，只重算派生状态
 """
 
 from __future__ import annotations
@@ -51,6 +52,7 @@ def _snapshot(mem: Memory) -> dict:
         "低产话题": list(lists["low_yield_topics"]),
         "钝刀": list(lists["blunt_angles"]),
         "利刃": list(lists["sharp_angles"]),
+        "记过的招": sorted(mem.data["angle_stats"]),
     }
 
 
@@ -82,6 +84,11 @@ def main() -> int:
         metavar="YYYY-MM-DD",
         help="只删这个日期之前的冷场战绩。不给就删全部自动判定的冷场",
     )
+    parser.add_argument(
+        "--rebuild",
+        action="store_true",
+        help="一条战绩都不删，只按现有战绩把派生状态重算一遍（改了统计口径之后用）",
+    )
     args = parser.parse_args()
 
     mem = Memory()
@@ -90,6 +97,26 @@ def main() -> int:
         return 0
 
     before_state = _snapshot(mem)
+
+    if args.rebuild:
+        # 统计口径改了之后，光有新代码不够：angle_stats 里的旧账是按老口径
+        # 攒出来的，不重放一遍就会一直留着（比如 "3.10+3.4" 那个复合桶）。
+        mem.rebuild_derived_state()
+        print("按现有战绩重算派生状态：\n")
+        after = _snapshot(mem)
+        if before_state == after:
+            print("  （没有变化，派生状态本来就是对的）")
+        else:
+            _print_diff(before_state, after)
+        if not args.apply:
+            print("\n（预览模式，文件没动。确认无误后加 --apply）")
+            return 0
+        backup = mem.path.with_suffix(".json.bak")
+        shutil.copy2(mem.path, backup)
+        mem.save()
+        print(f"\n已写回 {mem.path}，原文件备份在 {backup}")
+        return 0
+
     doomed = mem.drop_battles(lambda b: _is_phantom_cold(b, args.before))
 
     if not doomed:

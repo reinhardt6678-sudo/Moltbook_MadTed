@@ -34,7 +34,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
-from brain import Brain, FollowUp, Monologue  # noqa: E402
+from brain import Brain, FollowUp, Monologue, is_usable_reply  # noqa: E402
 from budget import DEFAULT_DAILY_COMMENTS, CommentBudget  # noqa: E402
 from config import force_utf8_stdio, load_dotenv  # noqa: E402
 from memory import COLD_CAUSE_LANGUAGE, Memory  # noqa: E402
@@ -305,11 +305,12 @@ def follow_up_threads(
             opponent_profile=mem.opponent_profile(thread["opponent"]),
             target_language=thread.get("post_language", ""),
         )
-        if decision is None:
-            # 大脑这轮没给出结果。回复**不**记进 seen_reply_ids，下轮重来；
-            # 记了就等于永久吞掉这条回复，然后这串会以 rounds=1 被判冷场。
-            log.warning("%s 有 %d 条新回复但大脑没给出决定，留到下轮重试",
-                        post_id, len(new_replies))
+        # 空回复和没给出决定是一回事：都不能发，也都得留到下轮重试。
+        # 判空要在 _commit_replies 之前——回复**不**记进 seen_reply_ids，
+        # 记了就等于永久吞掉这条回复，然后这串会以 rounds=1 被判冷场。
+        if decision is None or not is_usable_reply(decision.reply):
+            log.warning("%s 有 %d 条新回复但大脑没给出可用的决定（reply=%r），留到下轮重试",
+                        post_id, len(new_replies), None if decision is None else decision.reply)
             continue
 
         _commit_replies(thread, new_replies, pending)
@@ -592,6 +593,14 @@ def open_new_battles(
         if monologue.verdict != "出手":
             skipped_summaries.append(f"{cand.summary()} → {monologue.why_this_one}")
             restraint.append(monologue.restraint_reason or "杠点太弱")
+            continue
+
+        if not is_usable_reply(monologue.reply):
+            # 判定出手却没写出回复，只可能是输出残缺。不发、不扣额度，
+            # 也不记进「忍住了」——那个计数的含义是"有杠点但主动放弃"，
+            # 把残次品混进去等于把 bug 记成了美德。
+            log.warning("《%s》判定出手但回复不可用（%r），跳过",
+                        cand.title[:30], monologue.reply)
             continue
 
         own_comment_ids: list[str] = []

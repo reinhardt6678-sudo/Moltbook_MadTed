@@ -305,3 +305,57 @@ def test_drop_keeps_unrelated_battles(mem):
 
     assert [b["post_id"] for b in mem.data["battles"]] == ["keep"]
     assert mem.data["state"]["gang_power"] == 20
+
+
+# ---------- 复合角度的账目 ----------
+
+
+def test_composite_angle_counts_toward_each_move(mem):
+    """一次报两招时，两招各记一次——整串当一个 key 会多出个谁也不认识的桶。"""
+    _battle(mem, angle_used="3.10+3.4")
+
+    assert set(mem.data["angle_stats"]) == {"3.10", "3.4"}
+    assert mem.data["angle_stats"]["3.10"]["used"] == 1
+    assert mem.data["angle_stats"]["3.4"]["used"] == 1
+
+
+def test_composite_angle_does_not_dilute_the_ban_math(mem):
+    """热力图的 35% 是靠 angle_stats 的分母算的，复合桶会把两招的占比都稀释掉。
+
+    20 场里 3.4 出手 8 次（40%），其中 1 次是和 3.10 一起报的。
+    按整串记的话 3.4 只剩 7/20 = 35%，压线不触发，禁用令就晚来一周。
+    """
+    for i in range(7):
+        _battle(mem, post_id=f"a{i}", angle_used="3.4")
+    _battle(mem, post_id="a7", angle_used="3.10+3.4")
+    for i in range(12):
+        _battle(mem, post_id=f"b{i}", angle_used="3.2")
+
+    assert mem.data["angle_stats"]["3.4"]["used"] == 8
+    assert mem.data["angle_ban"]["banned"] == "3.4"
+
+
+def test_none_is_not_a_move(mem):
+    """'none' 是"这轮没用招"，不该在分母里占位。"""
+    _battle(mem, angle_used="none")
+
+    assert mem.data["angle_stats"] == {}
+
+
+def test_opponent_dossier_lists_single_moves(mem):
+    """档案是喂给大脑的，"3.10+3.4"这种串会让它以为有这么一招。"""
+    _battle(mem, opponent="vina", angle_used="3.10+3.4", rounds=3)
+
+    profile = mem.opponent_profile("vina")
+
+    assert sorted(profile["effective_angles"]) == ["3.10", "3.4"]
+
+
+def test_rebuild_splits_composites_recorded_by_the_old_code(mem):
+    """旧账是按老口径攒的，重放战绩就该把它拆开——不然那个桶会一直留着。"""
+    _battle(mem, angle_used="3.10+3.4")
+    mem.data["angle_stats"] = {"3.10+3.4": {"used": 1, "effective": 0}}
+
+    mem.rebuild_derived_state()
+
+    assert set(mem.data["angle_stats"]) == {"3.10", "3.4"}

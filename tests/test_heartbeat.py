@@ -130,6 +130,22 @@ def _spent_budget(*, cap: int) -> CommentBudget:
     )
 
 
+def a_reply(**overrides) -> dict:
+    """一条**真的冲我来的**回复：挂在我那条评论（own-1）底下。
+
+    评论区是有层级的，别人回我一定是挂在我的评论下面。楼里那些顶层评论是
+    旁人自己在讨论，不算对方回了我——见 test_bystander_comment_is_not_a_reply。
+    """
+    reply = {
+        "id": "r1",
+        "author": {"name": "hypebot"},
+        "content": "证据就是趋势",
+        "parent_id": "own-1",
+    }
+    reply.update(overrides)
+    return reply
+
+
 def a_decision(**overrides) -> FollowUp:
     payload = {
         "has_new_angle": True,
@@ -188,7 +204,7 @@ def test_finds_replies_when_notifications_endpoint_is_dead():
     满帖子的回复一条都看不见，最后全被记成冷场。
     """
     client = FakeClient(
-        {"p1": [{"id": "r1", "author": {"name": "hypebot"}, "content": "证据就是趋势"}]},
+        {"p1": [a_reply()]},
         notifications_fail=True,
     )
     brain = FakeBrain(a_decision())
@@ -245,7 +261,7 @@ def test_own_comment_is_not_treated_as_a_reply():
         {
             "p1": [
                 {"id": "own-1", "author": {"name": "MadTed"}, "content": "我自己发的"},
-                {"id": "r1", "author": {"name": "hypebot"}, "content": "对方回的"},
+                a_reply(content="对方回的"),
             ]
         }
     )
@@ -314,7 +330,7 @@ def test_reply_aimed_at_someone_else_is_skipped():
 def test_reply_is_retried_when_brain_returns_nothing():
     """大脑没给出决定时，回复不能被记成已读——记了就永远丢了。"""
     client = FakeClient(
-        {"p1": [{"id": "r1", "author": {"name": "hypebot"}, "content": "回了"}]}
+        {"p1": [a_reply(content="回了")]}
     )
     threads = {"p1": make_thread()}
 
@@ -336,7 +352,7 @@ def test_reply_is_retried_when_brain_returns_nothing():
 def test_idle_counter_resets_on_new_reply():
     """有人接话就把闲置计数清零，否则热闹的串也会被判冷场。"""
     client = FakeClient(
-        {"p1": [{"id": "r1", "author": {"name": "hypebot"}, "content": "接话"}]}
+        {"p1": [a_reply(content="接话")]}
     )
     mem = FakeMemory()
     threads = {"p1": make_thread(idle_cycles=2)}
@@ -368,7 +384,7 @@ def test_abandoned_multi_round_thread_is_not_cold():
 def test_own_reply_id_is_remembered_for_next_cycle():
     """追问发出去之后要记下自己的评论 id，下轮才认得出哪条是自己。"""
     client = FakeClient(
-        {"p1": [{"id": "r1", "author": {"name": "hypebot"}, "content": "回了"}]}
+        {"p1": [a_reply(content="回了")]}
     )
     threads = {"p1": make_thread()}
 
@@ -496,7 +512,7 @@ def test_thread_without_timestamp_falls_back_to_cycle_count():
 def test_follow_up_refreshes_the_activity_timestamp():
     """每次追问都要刷新时间戳，否则一场热闹的多轮对线会拿开局时间去判冷场。"""
     client = FakeClient(
-        {"p1": [{"id": "r1", "author": {"name": "hypebot"}, "content": "接话"}]}
+        {"p1": [a_reply(content="接话")]}
     )
     mem = FakeMemory()
     threads = {"p1": make_thread(last_activity_at=_hours_ago(20))}
@@ -512,7 +528,7 @@ def test_follow_up_refreshes_the_activity_timestamp():
 def test_follow_up_stops_when_budget_is_gone():
     """额度用完时不追问，也不能把这些回复吞掉——下轮还要接着答。"""
     client = FakeClient(
-        {"p1": [{"id": "r1", "author": {"name": "hypebot"}, "content": "接话"}]}
+        {"p1": [a_reply(content="接话")]}
     )
     mem = FakeMemory()
     brain = FakeBrain(a_decision())
@@ -531,7 +547,7 @@ def test_follow_up_stops_when_budget_is_gone():
 
 def test_follow_up_spends_one_unit_per_reply():
     client = FakeClient(
-        {"p1": [{"id": "r1", "author": {"name": "hypebot"}, "content": "接话"}]}
+        {"p1": [a_reply(content="接话")]}
     )
     mem = FakeMemory()
     budget = _spent_budget(cap=5)
@@ -599,7 +615,7 @@ def test_truncated_follow_up_is_not_posted_and_the_reply_waits_for_next_round():
     最后 agent 学到的是"这个角度没人接"，而真相是它自己没说出话来。
     """
     client = FakeClient(
-        {"p1": [{"id": "r1", "author": {"name": "hypebot"}, "content": "接话"}]}
+        {"p1": [a_reply(content="接话")]}
     )
     mem = FakeMemory()
     budget = _spent_budget(cap=5)
@@ -671,3 +687,141 @@ def test_a_complete_new_battle_still_goes_out():
     assert client.posted == [("p9", "Which teams, and how did you count them?")]
     assert budget.used == 1
     assert threads["p9"]["rounds"] == 1
+
+
+# ---------- 旁人在楼里说话 ≠ 对方回我 ----------
+
+
+def test_bystander_comment_is_not_a_reply():
+    """楼里旁人的顶层评论不算对方回我，既不该触发追问，也不该清零闲置计数。
+
+    这是线上那个 bug：认不出自己就判不出"这条是回谁的"，于是热帖底下任何人
+    说任何话都被当成对方回了我。后果是明明没人接话却每轮都去追问，额度全花在
+    自说自话上；idle_cycles 又被旁人的发言按住清零，这串永远等不到收尾。
+    """
+    client = FakeClient(
+        {
+            "p1": [
+                {"id": "b1", "author": {"name": "路人甲"}, "content": "同意楼主"},
+                {"id": "b2", "author": {"name": "路人乙"}, "content": "顺便问个别的"},
+                # 对手本人在自己楼里另起一条，也没回我
+                {"id": "b3", "author": {"name": "hypebot"}, "content": "补充一点"},
+            ]
+        }
+    )
+    mem = FakeMemory()
+    threads = {"p1": make_thread(idle_cycles=2)}
+
+    handled, checked = heartbeat.follow_up_threads(
+        client, FakeBrain(a_decision()), mem, threads, dry_run=False
+    )
+    heartbeat._reap_cold_threads(mem, threads, checked)
+
+    assert handled == 0
+    assert client.posted == []
+    assert threads["p1"]["idle_cycles"] == 3
+    assert [t["role"] for t in threads["p1"]["turns"]] == ["self"]
+
+
+def test_reply_nested_under_a_reply_to_me_counts():
+    """回"回我的人"的那条也算这场对线——都在我挑起的那串底下。"""
+    client = FakeClient(
+        {
+            "p1": [
+                {"id": "r1", "author": {"name": "路人甲"}, "content": "我替楼主答",
+                 "parent_id": "own-1"},
+                {"id": "r2", "author": {"name": "hypebot"}, "content": "我也补一句",
+                 "parent_id": "r1"},
+            ]
+        }
+    )
+    threads = {"p1": make_thread()}
+
+    handled, _ = heartbeat.follow_up_threads(
+        client, FakeBrain(a_decision()), FakeMemory(), threads, dry_run=False
+    )
+
+    assert handled == 1
+    assert [t["text"] for t in threads["p1"]["turns"] if t["role"] == "opponent"] == [
+        "我替楼主答",
+        "我也补一句",
+    ]
+
+
+def test_mention_counts_as_a_reply():
+    """评论区是平的时候（没有 parent_id），点名 @ 我就是唯一的信号。"""
+    client = FakeClient(
+        {"p1": [{"id": "r1", "author": {"name": "hypebot"},
+                 "content": "@MadTed 你这个说法本身就有问题"}]}
+    )
+    threads = {"p1": make_thread()}
+
+    handled, _ = heartbeat.follow_up_threads(
+        client, FakeBrain(a_decision()), FakeMemory(), threads, dry_run=False
+    )
+
+    assert handled == 1
+
+
+def test_self_is_recovered_when_own_comment_ids_are_empty():
+    """老讨论串没存过自己的评论 id，要能靠作者名把自己回捞出来。
+
+    否则"挂在我评论下面"这个判据没有锚点，真回复照样会被当成旁人讨论漏掉。
+    """
+    client = FakeClient(
+        {
+            "p1": [
+                {"id": "c-mine", "author": {"name": "MadTed"},
+                 "content": "这个'一定'的证据是什么？"},
+                {"id": "r1", "author": {"name": "hypebot"}, "content": "证据是趋势",
+                 "parent_id": "c-mine"},
+            ]
+        }
+    )
+    threads = {"p1": make_thread(own_comment_ids=[])}
+
+    handled, _ = heartbeat.follow_up_threads(
+        client, FakeBrain(a_decision()), FakeMemory(), threads, dry_run=False
+    )
+
+    assert handled == 1
+    # 回捞到的要存回去，下一轮不用再猜
+    assert "c-mine" in threads["p1"]["own_comment_ids"]
+
+
+def test_self_name_reads_the_nested_agent_object():
+    """名字在 agent 子对象里。读成空字符串的话，认自己就只剩 id 一条路。"""
+
+    class Status:
+        def get_agent_status(self):
+            return {"success": True, "agent": {"name": "codingclaude_559248874"}}
+
+    assert heartbeat._self_name(Status()) == "codingclaude_559248874"
+
+
+def test_unidentifiable_self_does_not_count_as_silence():
+    """认不出自己就没有判"这条回给谁"的锚点，这一轮该按没查成算。
+
+    否则整个评论区都归不了类，看上去就是"没人回我"——又一次把
+    "我没看见"当成"没人理我"，好角度会因此进「钝刀」。
+    """
+
+    class NamelessClient(FakeClient):
+        def get_agent_status(self):
+            return {"success": True}
+
+    client = NamelessClient(
+        {"p1": [{"id": "b1", "author": {"name": "路人甲"}, "content": "楼里聊别的"}]}
+    )
+    mem = FakeMemory()
+    # 自己的评论 id 没存过，turns 里的原文也对不上评论区
+    threads = {"p1": make_thread(own_comment_ids=[], turns=[{"role": "self", "text": "对不上"}])}
+
+    handled, checked = heartbeat.follow_up_threads(
+        client, FakeBrain(a_decision()), mem, threads, dry_run=False
+    )
+
+    assert handled == 0
+    assert checked == set()          # 没查成 → 不计入闲置
+    heartbeat._reap_cold_threads(mem, threads, checked)
+    assert threads["p1"]["idle_cycles"] == 0

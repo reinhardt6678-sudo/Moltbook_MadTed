@@ -41,6 +41,7 @@ from memory import COLD_CAUSE_LANGUAGE, Memory  # noqa: E402
 from moltbook_client import (  # noqa: E402
     MoltbookClient,
     MoltbookError,
+    agent_self_name,
     author_name,
     comment_id,
     notification_post_id,
@@ -139,7 +140,12 @@ def _format_transcript(thread: dict, pending: list[dict] | None = None) -> str:
 
 
 def _self_name(client: MoltbookClient) -> str:
-    """自己在 Moltbook 上的名字。取不到就返回空字符串（靠 own_comment_ids 兜底）。"""
+    """自己在 Moltbook 上的名字。取不到就返回空字符串（靠 own_comment_ids 兜底）。
+
+    名字藏在返回体的 `agent` 子对象里。以前这里只读顶层的 name/username，
+    结果一直是空字符串——而它的兜底 own_comment_ids 当时也是空的（写入那条路
+    没解信封），两条认自己的路一起断了，"谁在回我"就彻底判不出来了。
+    """
     override = os.environ.get("MADTED_AGENT_NAME", "").strip()
     if override:
         return override
@@ -148,7 +154,11 @@ def _self_name(client: MoltbookClient) -> str:
     except MoltbookError as exc:
         log.warning("拿不到自己的 agent 名字（%s），只能靠自己发过的评论 id 认自己", exc)
         return ""
-    return str(status.get("name") or status.get("username") or "")
+    name = agent_self_name(status)
+    if not name:
+        log.warning("状态里没有自己的名字（%s），只能靠自己发过的评论 id 认自己",
+                    ",".join(sorted(status)) or "空返回")
+    return name
 
 
 def _inbox_hints(client: MoltbookClient) -> set[str]:
@@ -169,6 +179,53 @@ def _inbox_hints(client: MoltbookClient) -> set[str]:
     return hints
 
 
+def _identify_self(
+    thread: dict, replies: list[dict], self_name: str
+) -> tuple[set[str], set[str]]:
+    """认出评论区里哪几条是我说的，返回 (评论 id, 原文)。
+
+    发评论时存下来的 id 优先。老讨论串没存过，`create_comment` 解不出 id 的
+    那段时间存的也是空列表，这时靠作者名和原文把自己回捞出来——认不出自己，
+    "这条是不是冲我来的"就无从判起。回捞到的会写回 own_comment_ids，
+    下一轮不用再猜。
+    """
+    own_texts = {t["text"] for t in thread.get("turns", []) if t.get("role") == "self"}
+    own = {rid for rid in thread.get("own_comment_ids", []) if rid}
+    for reply in replies:
+        rid = comment_id(reply)
+        if not rid or rid in own:
+            continue
+        text = reply.get("content") or reply.get("body") or ""
+        if (self_name and author_name(reply) == self_name) or (text and text in own_texts):
+            own.add(rid)
+    if own and own != {rid for rid in thread.get("own_comment_ids", []) if rid}:
+        thread["own_comment_ids"] = sorted(own)
+    return own, own_texts
+
+
+def _aimed_at_me(reply: dict, by_id: dict[str, dict], own: set[str], mention: str) -> bool:
+    """这条评论是不是冲我来的。
+
+    两种算：挂在我那条评论的子树底下（直接回我的，以及回"回我的人"的——
+    都在我挑起的那串里），或者正文点名 @ 我（评论区是平的时候只剩这个信号）。
+
+    其余的是楼里旁人自己的讨论。热帖底下这种能有上百条，把它们当成"对方回我了"
+    有两个后果：明明没人接话却每轮都去追问，额度全花在自说自话上；
+    以及 idle_cycles 被旁人的发言清零，这串永远等不到收尾。
+    """
+    text = (reply.get("content") or reply.get("body") or "").lower()
+    if mention and mention in text:
+        return True
+    parent = parent_comment_id(reply)
+    hops = 0
+    while parent and hops < 20:  # hops 只为防父链成环，正常层数远小于这个数
+        if parent in own:
+            return True
+        parent = parent_comment_id(by_id.get(parent) or {})
+        hops += 1
+    return False
+
+
 def _new_replies_for(
     client: MoltbookClient, post_id: str, thread: dict, self_name: str
 ) -> list[dict] | None:
@@ -176,6 +233,9 @@ def _new_replies_for(
 
     返回 None 表示**这次没查成**（拉取失败），和"查了但没有新回复"是两回事——
     前者不能拿去当冷场的证据。
+
+    "冲我来的"是真的按父链判的。以前判不出来（认不出自己），就退成了
+    "宁可多读一条"，实际效果是帖子底下任何人说任何话都算对方回了我。
     """
     try:
         replies = client.get_replies(post_id)
@@ -184,13 +244,18 @@ def _new_replies_for(
         return None
 
     seen = set(thread.get("seen_reply_ids", []))
-    own = set(thread.get("own_comment_ids", []))
-    opponent = thread["opponent"]
-    # 老讨论串没存过 own_comment_ids，status 端点也可能不返回名字。
-    # 这时靠原文比对认自己——比认错人去和自己对线强。
-    own_texts = {t["text"] for t in thread["turns"] if t["role"] == "self"}
+    own, own_texts = _identify_self(thread, replies, self_name)
+    by_id = {comment_id(r): r for r in replies if comment_id(r)}
+    mention = f"@{self_name}".lower() if self_name else ""
+
+    if replies and not own and not mention:
+        # 认不出自己，就没有判"这条是回谁的"的锚点。这种时候整个评论区都无法归类，
+        # 按"这轮没查成"处理——和拉取失败一样，不能拿来当没人理我的证据。
+        log.warning("%s：既认不出自己发过的评论、也不知道自己的名字，这轮不作数", post_id)
+        return None
 
     fresh = []
+    bystanders = 0
     for reply in replies:
         rid = comment_id(reply)
         if rid and (rid in seen or rid in own):
@@ -204,14 +269,14 @@ def _new_replies_for(
         if (reply.get("content") or reply.get("body") or "") in own_texts:
             continue
 
-        # 只在**能确定是回给别人**时才排除：父级明确指向不是我的评论、
-        # 且作者也不是原帖作者。字段缺失一律按"可能是冲我来的"处理——
-        # 宁可多读一条无关评论，也不能把真回复漏成冷场。
-        parent = parent_comment_id(reply)
-        if own and parent and parent not in own and author != opponent:
+        if not _aimed_at_me(reply, by_id, own, mention):
+            bystanders += 1
             continue
 
         fresh.append(reply)
+
+    if bystanders:
+        log.debug("%s：评论区新增 %d 条旁人讨论，不算对方回我", post_id, bystanders)
     return fresh
 
 

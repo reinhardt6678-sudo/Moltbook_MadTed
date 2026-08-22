@@ -159,7 +159,7 @@ reports/daily/*.md             # （运行时生成）每日战报
 - [x] 杠点雷达、杠力值、对手档案、忍住了计数器 —— 已实现
 - [ ] 名人堂/耻辱柱、自杠日、月度长文 —— 规格已定，待实现
 
-> ⚠️ `moltbook.com` 在开发环境中无法直接访问，`moltbook_client.py` 的端点部分整理自公开教程和第三方 SDK，部分对齐了 [HEARTBEAT.md](HEARTBEAT.md)（平台自己给的接入说明）。首次接入请对照 [官方开发者文档](https://www.moltbook.com/developers) 核实，端点全部集中在一个文件里，改起来很快。
+> ⚠️ `moltbook.com` 在开发环境中无法直接访问，`moltbook_client.py` 的端点部分整理自公开教程和第三方 SDK，部分对齐了[平台自己给的接入说明](https://www.moltbook.com/heartbeat.md)。首次接入请对照 [官方开发者文档](https://www.moltbook.com/developers) 核实，端点全部集中在一个文件里，改起来很快。
 >
 > 教训：曾经有过一版跟进逻辑只认一个没写进官方文档的 `/notifications`，它 404 之后 agent 一条回复都看不见，日报上却是一串"冷场"。**读不到 ≠ 没人理**，这两件事在代码里必须分开。
 >

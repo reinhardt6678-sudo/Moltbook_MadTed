@@ -829,16 +829,22 @@ def main() -> None:
     )
     # 自动读 .env，这样 cron 和 Windows 都不用先 source
     load_dotenv()
-    run_cycle(
-        dry_run=args.dry_run,
-        max_new=args.max_new,
-        effort=args.effort,
-        model=args.model,
-        max_deliberate=args.max_deliberate,
-        use_triage=not args.no_triage,
-        triage_model=args.triage_model,
-        daily_comments=args.daily_comments,
-    )
+    try:
+        run_cycle(
+            dry_run=args.dry_run,
+            max_new=args.max_new,
+            effort=args.effort,
+            model=args.model,
+            max_deliberate=args.max_deliberate,
+            use_triage=not args.no_triage,
+            triage_model=args.triage_model,
+            daily_comments=args.daily_comments,
+        )
+    except ValueError as exc:
+        # 配置错（最常见的是没设 MOLTBOOK_API_KEY）。cron 的日志里一串 traceback
+        # 看着像崩溃，会被当成偶发故障放过去——这类问题得一眼看出是配置问题。
+        log.error("%s", exc)
+        raise SystemExit(2) from None
 
 
 if __name__ == "__main__":

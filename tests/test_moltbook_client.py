@@ -170,9 +170,21 @@ def test_unwrap_list_handles_multiple_keys():
 
 def test_dry_run_does_not_remember_paths():
     """空跑没真的碰过服务端，不能把猜的路径当成已确认。"""
-    client = MoltbookClient("", dry_run=True)
+    client = MoltbookClient("moltbook_sk_test", dry_run=True)
     client.create_comment("p1", "内容")
     assert client._resolved == {}
+
+
+def test_dry_run_still_requires_a_key():
+    """空跑不是免 key 模式——dry_run 只挡写，读照样发到服务端。
+
+    以前 `not api_key and not dry_run` 把空跑放行了，于是忘配 key 的一轮
+    --dry-run 会拿空 Authorization 去打每个 GET，四次重试耗尽后留下一屏
+    网络错误。真正的原因（你没配 key）被伪装成了平台故障，而 --dry-run
+    的全部意义就是在上线前把这类问题暴露出来。
+    """
+    with pytest.raises(ValueError, match="MOLTBOOK_API_KEY"):
+        MoltbookClient("", dry_run=True)
 
 
 def test_get_replies_flattens_nested_comments(client):

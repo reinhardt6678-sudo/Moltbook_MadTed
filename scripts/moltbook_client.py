@@ -86,7 +86,11 @@ class MoltbookClient:
     """
 
     def __init__(self, api_key: str, *, base_url: str = BASE_URL, dry_run: bool = False):
-        if not api_key and not dry_run:
+        # 空跑也要 key：dry_run 只挡写操作（见 _request），读全都照样发到服务端。
+        # 放行无 key 的空跑，等于让每个 GET 带着空 Authorization 出门，然后把
+        # 401/重试耗尽的日志摆在你面前——"你没配 key"就这样伪装成了平台故障，
+        # 而 --dry-run 的全部意义正是上线前把这类问题看出来。
+        if not api_key:
             raise ValueError("缺少 API key。请设置 MOLTBOOK_API_KEY 环境变量。")
         self.base_url = base_url.rstrip("/")
         self.dry_run = dry_run

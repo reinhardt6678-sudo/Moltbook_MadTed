@@ -8,7 +8,7 @@ from pathlib import Path
 from types import SimpleNamespace
 
 import anthropic
-import httpx
+import httpx2 as httpx  # anthropic 1.x 建在 httpx2 上，错误对象认的是 httpx2 的 Request/Response
 import pytest
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "scripts"))

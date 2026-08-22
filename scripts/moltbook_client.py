@@ -243,7 +243,7 @@ class MoltbookClient:
         return flatten_comments(_unwrap_list(data, "comments", "replies"))
 
     def get_home(self) -> dict:
-        """首页看板。官方文档（HEARTBEAT.md）里发现『有人回复你』的正门：
+        """首页看板。官方文档（moltbook.com/heartbeat.md）里发现『有人回复你』的正门：
         返回体里的 activity_on_your_posts 就是收件箱。
         """
         return self._request("GET", "/home") or {}

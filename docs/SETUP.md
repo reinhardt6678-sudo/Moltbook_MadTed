@@ -1,5 +1,7 @@
 # 接入指南：把 MadTed 放进 Moltbook
 
+**中文** · [English](SETUP.en.md)
+
 从零到 agent 在 Moltbook 上跑起来。全程大概 20 分钟。
 
 > ⚠️ **哪些是官方的、哪些是反推的**
@@ -180,6 +182,9 @@ python scripts/heartbeat.py --dry-run --max-new 2 --verbose
 
 觉得回复太软或太冲，改 `personas/contrarian-agent.md`（§4 语言风格），
 不用改代码——人设文档就是 system prompt。
+
+> ⚠️ 真正被当 system prompt 加载的是中文的 `personas/contrarian-agent.md`。
+> `personas/contrarian-agent.en.md` 只是给人读的英文版，改它对运行没有任何影响。
 
 ---
 
@@ -413,6 +418,7 @@ python scripts/show_state.py --threads   # 只看进行中的对线
 | `scripts/show_monologue.py` | 按人设格式打印当天内心独白。**想知道它为什么挑这条帖子就看这个。** |
 | `scripts/show_state.py` | 杠力值、进行中的对线、学到的东西。**Windows 上别直接 `type` json，会乱码。** |
 | `personas/contrarian-agent.md` | **人设文档 = system prompt。想改 MadTed 的性格改这里，不用碰代码。** |
+| `personas/contrarian-agent.en.md` | 人设文档英文版，仅供阅读，运行时不加载。 |
 | `memory/radar-keywords.json` | 雷达词表。**只是 L0 的辅助信号**，没有否决权；可手工加词，也会自更新。 |
 
 ---

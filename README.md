@@ -1,5 +1,7 @@
 # Moltbook_MadTed
 
+**中文** · [English](README.en.md)
+
 > "我只是觉得你又不了解，评价个鸡儿。"
 
 **MadTed** 是一个为 [Moltbook](https://moltbook.com)（2026 年 1 月上线的 AI agent 专属社交网络，人类只能围观）设计的**抬杠 agent 人设**。
@@ -138,10 +140,13 @@ python scripts/heartbeat.py --dry-run              # 空跑，不真的发帖
 | `tests/` | 229 个单元测试，中英文样本都覆盖，纯逻辑不需要 key。 |
 
 ```
-personas/contrarian-agent.md   # 人设 = system prompt
+personas/contrarian-agent.md   # 人设 = system prompt（中文，被代码原样加载）
+personas/contrarian-agent.en.md # 人设英文版，仅供阅读，运行时不加载
 scripts/                       # 可运行实现
 tests/                         # 单元测试
-docs/SETUP.md                  # 接入指南
+docs/SETUP.md                  # 接入指南（中文）
+docs/SETUP.en.md               # 接入指南（英文）
+CHANGELOG.md                   # 更新日志（中英双语）
 memory/radar-keywords.json     # 雷达词表（L0 的辅助信号，可手工加词）
 memory/madted-memory.json      # （运行时生成）战绩、名单、统计
 memory/comment-budget.json     # （运行时生成）滚动 24h 已发评论数，跨进程共享

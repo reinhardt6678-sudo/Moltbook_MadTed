@@ -95,19 +95,42 @@ def _load_threads() -> dict:
     return {}
 
 
-def _save_threads(threads: dict) -> None:
+def _save_threads(threads: dict, *, dry_run: bool = False) -> None:
+    # 空跑不落盘。讨论串里记着"这条我已经回过了"（rounds、seen_reply_ids、
+    # used_angles），写进去之后真跑就会跳过它，那条评论永远发不出去。
+    # EN: a dry run never persists. A thread carries "I already answered this
+    # one" (rounds / seen_reply_ids / used_angles); write that out and the next
+    # live run skips the post — the comment never actually goes out.
+    if dry_run:
+        return
     THREADS_PATH.parent.mkdir(parents=True, exist_ok=True)
     THREADS_PATH.write_text(
         json.dumps(threads, ensure_ascii=False, indent=2), encoding="utf-8"
     )
 
 
-def _append_monologue(entry: dict) -> None:
-    """内心独白按天存档，日报和主人都从这里读。"""
+def _append_monologue(entry: dict, *, dry_run: bool = False) -> None:
+    """内心独白按天存档，日报和主人都从这里读。
+
+    空跑照写——独白正是空跑最有价值的产出，而且这份存档只被日报和
+    show_monologue 读，不进任何决策路径，写了不会反过来影响下一轮选题。
+    但要打上 dry_run 标记：没发出去的评论不能在战报里冒充战绩。
+
+    EN: the inner monologue, archived by day; the daily report and the owner
+    both read it from here. Dry runs still write — the monologue is the whole
+    point of a dry run, and this archive is read only by the daily report and
+    show_monologue, never by the decision path, so writing it cannot skew the
+    next cycle's picks. It does get a dry_run marker: comments that were never
+    sent must not pass for real ones in the report.
+    """
     MONOLOGUE_DIR.mkdir(parents=True, exist_ok=True)
     path = MONOLOGUE_DIR / f"{date.today().isoformat()}.jsonl"
+    # 标记放最后，免得被 entry 里 model_dump 展开出来的同名字段盖掉
+    # EN: marker goes last so a same-named field expanded out of model_dump
+    # cannot shadow it
+    payload = {**entry, "dry_run": True} if dry_run else entry
     with open(path, "a", encoding="utf-8") as fh:
-        fh.write(json.dumps(entry, ensure_ascii=False) + "\n")
+        fh.write(json.dumps(payload, ensure_ascii=False) + "\n")
 
 
 def _format_post(post: dict) -> str:
@@ -391,7 +414,8 @@ def follow_up_threads(
                 "conceded": decision.conceded,
                 "angle": decision.angle,
                 "reply": decision.reply,
-            }
+            },
+            dry_run=dry_run,
         )
 
         if dry_run:
@@ -652,7 +676,8 @@ def open_new_battles(
                 "post_language": post_language,
                 "triage": verdict.model_dump() if verdict is not None else None,
                 **monologue.model_dump(),
-            }
+            },
+            dry_run=dry_run,
         )
 
         if monologue.verdict != "出手":
@@ -738,7 +763,7 @@ def run_cycle(
     brain = Brain(effort=effort, model=model)
     # L1 和 L2 共用一个 anthropic 客户端，省一次连接初始化
     triage = Triage(client=brain.client, model=triage_model) if use_triage else None
-    mem = Memory()
+    mem = Memory(dry_run=dry_run)
     threads = _load_threads()
     # 落盘的额度，跨进程有效——每小时一轮时唯一挡得住"一天发爆"的东西
     budget = CommentBudget(cap=daily_comments, dry_run=dry_run)
@@ -767,8 +792,13 @@ def run_cycle(
     log.info("阶段2：开了 %d 个新杠，忍住了 %d 条", engaged, len(restraint))
 
     mem.record_restraint(restraint)
+    # 空跑时这两个都是空操作（各自认 dry_run）：记忆照常在内存里演进，
+    # 日志和独白存档看到的仍是完整的一轮，只是不留在盘上
+    # EN: both are no-ops under dry_run (each honours its own flag): memory
+    # keeps evolving in process, so the logs and the monologue archive still see
+    # a full cycle — it just leaves nothing behind on disk
     mem.save()
-    _save_threads(threads)
+    _save_threads(threads, dry_run=dry_run)
     log.info("=== heartbeat 结束 | 杠力值 %s | %s ===",
              mem.data["state"]["gang_power"], budget.summary())
 

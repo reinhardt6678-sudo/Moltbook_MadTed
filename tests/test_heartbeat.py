@@ -6,9 +6,11 @@
 
 from __future__ import annotations
 
+import json
 import sys
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
@@ -17,6 +19,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "scripts"))
 import heartbeat  # noqa: E402
 from brain import FollowUp, Monologue  # noqa: E402
 from budget import CommentBudget  # noqa: E402
+from memory import Memory  # noqa: E402
 from moltbook_client import (  # noqa: E402
     MoltbookError,
     author_name,
@@ -188,10 +191,17 @@ def a_post(**overrides) -> dict:
     return post
 
 
+# fixture 会把 _append_monologue 挡掉，这里先留一份真身：要验真实写盘行为的
+# 测试直接调它。
+# EN: the fixture stubs _append_monologue out, so keep a handle on the real one
+# here — tests that check actual disk writes call it directly.
+_real_append_monologue = heartbeat._append_monologue
+
+
 @pytest.fixture(autouse=True)
 def no_disk_writes(monkeypatch):
     """独白日志写盘和测试无关，挡掉。"""
-    monkeypatch.setattr(heartbeat, "_append_monologue", lambda entry: None)
+    monkeypatch.setattr(heartbeat, "_append_monologue", lambda entry, **kwargs: None)
 
 
 # ---------- 核心回归：发现回复不依赖通知 ----------
@@ -825,3 +835,110 @@ def test_unidentifiable_self_does_not_count_as_silence():
     assert checked == set()          # 没查成 → 不计入闲置
     heartbeat._reap_cold_threads(mem, threads, checked)
     assert threads["p1"]["idle_cycles"] == 0
+
+
+# ---------- 空跑不许留下痕迹 ----------
+
+
+def _wire_cycle(monkeypatch, tmp_path):
+    """把 run_cycle 的外部依赖换成假的，只留下记忆和讨论串这两条真实的落盘路径。
+
+    Memory 和 _save_threads 用的是真货、只是把路径挪进 tmp——"空跑到底写不写盘"
+    正是这两个要测的东西，换成假的就等于测了个寂寞。
+
+    EN: swap run_cycle's external dependencies for fakes, keeping the two real
+    persistence paths — memory and threads. Memory and _save_threads are the
+    genuine article, only pointed at tmp: whether a dry run writes to disk is
+    exactly what those two decide, so faking them would test nothing at all.
+    """
+    memory_path = tmp_path / "madted-memory.json"
+    threads_path = tmp_path / "active-threads.json"
+
+    Memory(memory_path).save()
+    threads_path.write_text(
+        json.dumps({"p1": make_thread()}, ensure_ascii=False, indent=2),
+        encoding="utf-8",
+    )
+
+    # 对方回了我一条（挂在 own-1 下面）→ 跟进阶段有活干；
+    # feed 里再放一条够格的帖子 → 开新杠阶段也有活干。
+    # EN: one reply aimed at me (nested under own-1) gives the follow-up stage
+    # work; one qualifying post in the feed gives the new-battle stage its own.
+    client = FakeClient(replies={"p1": [a_reply()]}, feed=[a_post()])
+
+    monkeypatch.setattr(
+        heartbeat, "MoltbookClient", SimpleNamespace(from_env=lambda **kw: client)
+    )
+    monkeypatch.setattr(
+        heartbeat, "Brain", lambda **kw: FakeBrain(a_decision(), a_monologue())
+    )
+    monkeypatch.setattr(heartbeat, "Memory", lambda **kw: Memory(memory_path, **kw))
+    monkeypatch.setattr(
+        heartbeat,
+        "CommentBudget",
+        lambda **kw: CommentBudget(tmp_path / "budget.json", cap=5, dry_run=True),
+    )
+    monkeypatch.setattr(heartbeat, "THREADS_PATH", threads_path)
+    return client, memory_path, threads_path
+
+
+def test_dry_run_leaves_both_memory_files_byte_identical(tmp_path, monkeypatch):
+    """空跑跑完，盘上必须一个字节都没变。
+
+    线上踩过：空跑不发评论，却照样把 rounds、seen_reply_ids、扣掉的杠力值写了盘。
+    结果是那条评论在记忆里算"已经回过了"，之后真跑直接跳过——永远发不出去。
+
+    EN: after a dry run, not one byte on disk may change. Hit in production: the
+    dry run sent no comment, yet still persisted rounds, seen_reply_ids and the
+    docked gang power. Memory then counted that comment as "already answered",
+    so the next live run skipped it — and it never went out at all.
+    """
+    client, memory_path, threads_path = _wire_cycle(monkeypatch, tmp_path)
+    before_memory = memory_path.read_bytes()
+    before_threads = threads_path.read_bytes()
+
+    heartbeat.run_cycle(dry_run=True, max_new=1, use_triage=False)
+
+    assert client.posted == []
+    assert memory_path.read_bytes() == before_memory
+    assert threads_path.read_bytes() == before_threads
+
+
+def test_live_run_still_writes_both_memory_files(tmp_path, monkeypatch):
+    """反面对照：同一套输入真跑就该落盘。
+
+    没有这条，上面那条测试拿一个根本没跑起来的管道也能过。
+
+    EN: the control case — the same inputs on a live run must reach disk.
+    Without it, the test above would pass just as happily on a pipeline that
+    never ran at all.
+    """
+    client, memory_path, threads_path = _wire_cycle(monkeypatch, tmp_path)
+    before_memory = memory_path.read_bytes()
+    before_threads = threads_path.read_bytes()
+
+    heartbeat.run_cycle(dry_run=False, max_new=1, use_triage=False)
+
+    assert client.posted != []
+    assert memory_path.read_bytes() != before_memory
+    assert threads_path.read_bytes() != before_threads
+
+
+def test_dry_run_monologue_is_archived_but_marked(tmp_path, monkeypatch):
+    """独白照存——那是空跑的主要产出——但要带 dry_run 标记。
+
+    标记是给日报用的：没发出去的评论不能混进战绩统计。
+
+    EN: the monologue is archived either way — it is the main output of a dry
+    run — but carries a dry_run marker. The marker exists for the daily report:
+    comments that were never sent stay out of the battle stats.
+    """
+    monkeypatch.setattr(heartbeat, "MONOLOGUE_DIR", tmp_path)
+
+    _real_append_monologue({"kind": "deliberate", "verdict": "出手"}, dry_run=True)
+    _real_append_monologue({"kind": "deliberate", "verdict": "出手"})
+
+    lines = [json.loads(x) for x in
+             next(tmp_path.glob("*.jsonl")).read_text(encoding="utf-8").splitlines()]
+    assert lines[0]["dry_run"] is True
+    assert "dry_run" not in lines[1]

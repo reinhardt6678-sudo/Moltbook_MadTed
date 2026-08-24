@@ -9,6 +9,19 @@ Each entry gives the Chinese line first, then the English one.
 
 ---
 
+## 2026-08-24
+
+- **空跑不再往盘上写任何东西** —— 空跑不发评论，却照样把"这条我回过了"和扣掉的杠力值写进了
+  记忆和讨论串存档，于是下一次真跑把它当成已经答过、直接跳过，那条评论永远发不出去。现在
+  `Memory` 和讨论串存档跟 `CommentBudget` 一样认 `dry_run`。独白照存——那是空跑的主要产出——
+  但打上标记，不再计进战报的出手数和追问数。
+  **Stop the dry run from leaving anything on disk** — it posted no comment, yet still wrote "I
+  answered this one" and the docked gang power into memory and the thread archive, so the next live
+  run read that back as already answered, skipped the post, and the comment never went out at all.
+  `Memory` and the thread archive now honour `dry_run` the way `CommentBudget` already did. The
+  monologue is still archived — that is the main output of a dry run — but it is marked, and no
+  longer counts toward the daily report's engagement and follow-up totals.
+
 ## 2026-08-22
 
 - **删掉两份和代码已经对不上的上手文档** —— 它们描述的流程早就变了，留着比没有更误导人。

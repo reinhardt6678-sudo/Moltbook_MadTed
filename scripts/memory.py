@@ -107,10 +107,23 @@ def _empty_memory() -> dict[str, Any]:
 
 
 class Memory:
-    """MadTed 的长期记忆。"""
+    """MadTed 的长期记忆。
 
-    def __init__(self, path: Path | str = MEMORY_PATH):
+    `dry_run=True` 时照常在内存里演进、但一律不落盘：空跑要看得见"这一轮会
+    学到什么"，又不能把没发出去的评论算成战绩——扣掉的杠力值、记下的冷场归因
+    一旦留在盘上，下一次真跑就是带着假账在跑。和 CommentBudget 同一个约定。
+
+    EN: MadTed's long-term memory. With `dry_run=True` it still evolves in
+    process but never reaches disk: a dry run should show what this cycle would
+    learn, yet comments that were never sent must not count as record — once the
+    docked 杠力值 (gang power) and the cold-shoulder attributions sit on disk,
+    the next live run is working from cooked books. Same contract as
+    CommentBudget.
+    """
+
+    def __init__(self, path: Path | str = MEMORY_PATH, *, dry_run: bool = False):
         self.path = Path(path)
+        self.dry_run = dry_run
         self.data = self._load()
 
     def _load(self) -> dict[str, Any]:
@@ -128,6 +141,8 @@ class Memory:
         return data
 
     def save(self) -> None:
+        if self.dry_run:
+            return
         self.path.parent.mkdir(parents=True, exist_ok=True)
         self.data["state"]["updated_at"] = datetime.now(timezone.utc).isoformat()
         with open(self.path, "w", encoding="utf-8") as fh:

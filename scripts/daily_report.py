@@ -32,13 +32,25 @@ DAILY_DIR = ROOT / "reports" / "daily"
 
 
 def _read_monologues(day: str) -> list[dict]:
+    """当天的独白，空跑那些不算。
+
+    空跑的独白照样存档（那是空跑的主要产出），但它对应的评论根本没发出去。
+    战报统计的是"今天真的干了什么"，把空跑混进来，出手数、追问数全是虚的。
+
+    EN: the day's monologues, dry-run ones excluded. A dry run is still archived
+    (that is its main output), but the comments behind it were never sent. The
+    daily report counts what actually happened — mix dry runs in and the
+    出手/追问 (engagement / follow-up) totals are fiction.
+    """
     path = MONOLOGUE_DIR / f"{day}.jsonl"
     if not path.exists():
         return []
     entries = []
     for line in path.read_text(encoding="utf-8").splitlines():
         if line.strip():
-            entries.append(json.loads(line))
+            entry = json.loads(line)
+            if not entry.get("dry_run"):
+                entries.append(entry)
     return entries
 
 

@@ -20,9 +20,11 @@ A **persona document** (used as a system prompt) plus a set of **runnable Python
 ```bash
 pip install -r requirements.txt
 cp .env.example .env          # fill in MOLTBOOK_API_KEY and ANTHROPIC_API_KEY
-python -m pytest tests/ -q    # 229 tests, no API keys needed
+python -m pytest tests/ -q    # 285 tests, no API keys needed
 python scripts/preflight.py   # pre-flight check: keys, endpoints, directories in one pass
 python scripts/heartbeat.py --dry-run              # dry run, posts nothing
+python scripts/heartbeat.py --queue                # draft only, then approve by hand
+python scripts/approve.py                          # read each draft, send the ones you keep
 ```
 
 ## Design highlights
@@ -138,11 +140,13 @@ Running more often has a knock-on effect: the silence rule used to count only "3
 | `scripts/memory.py` | Memory and learning. Contrarian score, five-way silence attribution, truce list, angle statistics, cross-language weights for structural signals. |
 | `scripts/brain.py` | Calls Claude to generate the monologue and the reply. The persona document is the system prompt here (with prompt caching). |
 | `scripts/heartbeat.py` | Main flow: follow up on existing threads → start new ones → update memory. |
+| `scripts/pending.py` · `scripts/approve.py` | The draft queue. `--queue` parks what MadTed wants to say; you read each one and decide. Everything a draft would change is deferred to the moment you approve it, not thrown away. |
+| `scripts/halt.py` | The kill switch. A moderator warning stops the agent and needs a human to lift it — the one state where running another round has negative expected value. |
 | `scripts/repair_memory.py` | One-off maintenance: clears the phantom results left over from the period when replies were unreadable (the `冷场` and `一轮即止/对方停止回应` batches) and recomputes the derived lists. `--rebuild` deletes nothing and simply replays every record under the new rules — **run it after changing how stats are counted**; `--prune-turns` strips bystander comments that got recorded as part of an exchange. |
 | `scripts/daily_report.py` | Daily battle report. `--no-llm` shows raw stats only. |
 | `scripts/show_monologue.py` | Prints the day's monologue in persona format. **This is what to read when you want to know why it picked a given post.** |
 | `scripts/show_state.py` | Contrarian score, live exchanges, lessons learned. **On Windows, don't `type` the json directly — it will render as mojibake.** |
-| `tests/` | 229 unit tests, covering both Chinese and English samples, pure logic, no keys required. |
+| `tests/` | 285 unit tests, covering both Chinese and English samples, pure logic, no keys required. |
 
 ```
 personas/contrarian-agent.md      # persona = system prompt (Chinese, loaded verbatim)

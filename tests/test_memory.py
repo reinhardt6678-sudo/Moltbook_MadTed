@@ -359,3 +359,65 @@ def test_rebuild_splits_composites_recorded_by_the_old_code(mem):
     mem.rebuild_derived_state()
 
     assert set(mem.data["angle_stats"]) == {"3.10", "3.4"}
+
+
+# ---------- 姿态型冷场：票数说明的是姿态，不是角度钝 ----------
+
+
+def test_posture_cold_does_not_blame_the_angle(mem):
+    """被踩到负分之后的沉默，锅在姿态上——给这一招记一次"无效"会把好招打进钝刀。"""
+    _battle(mem, outcome="冷场", cold_cause="姿态型", angle_used="3.2", reactions=-9)
+    assert "3.2" not in mem.data["angle_stats"]
+
+
+def test_ordinary_cold_still_counts_against_the_angle(mem):
+    """对照组：普通冷场照旧记进角度统计，否则上面那条测了个寂寞。"""
+    _battle(mem, outcome="冷场", angle_used="3.2")
+    assert mem.data["angle_stats"]["3.2"] == {"used": 1, "effective": 0}
+
+
+def test_posture_cold_still_counts_as_a_battle(mem):
+    """只豁免角度统计，分照扣、战绩照留档。"""
+    assert _battle(mem, outcome="冷场", cold_cause="姿态型") == -2
+    assert len(mem.data["battles"]) == 1
+
+
+def test_reactions_default_to_unknown_not_zero(mem):
+    """平台没给票数就是 None。记成 0 等于编一个"零反响"的事实出来。"""
+    _battle(mem)
+    assert mem.data["battles"][0]["reactions"] is None
+
+
+def test_rebuild_keeps_the_posture_exemption(mem):
+    """重放战绩时豁免也要跟着重放，否则 repair 一次就把结论改了。"""
+    _battle(mem, outcome="冷场", cold_cause="姿态型", angle_used="3.2")
+    _battle(mem, outcome="一轮即止", angle_used="3.4")
+    mem.rebuild_derived_state()
+    assert "3.2" not in mem.data["angle_stats"]
+    assert mem.data["angle_stats"]["3.4"]["used"] == 1
+
+
+# ---------- moderator 警告 ----------
+
+
+def test_a_warning_does_not_pollute_angle_stats(mem):
+    """angle 填 none，不能让 -50 顺手给某一招记一次使用。"""
+    mem.record_warning("w1", source="Clawd", note="spam")
+    assert mem.data["angle_stats"] == {}
+
+
+def test_a_warning_survives_a_rebuild(mem):
+    """走战绩而不是直接改分数，就是为了能被重放和撤销。"""
+    _battle(mem, outcome="对方改口")
+    mem.record_warning("w1", source="Clawd", note="spam")
+    before = mem.data["state"]["gang_power"]
+    mem.rebuild_derived_state()
+    assert mem.data["state"]["gang_power"] == before
+
+
+def test_dropping_a_warning_gives_the_score_back(mem):
+    """误判必须撤得回来——-50 是全表最重的一档。"""
+    _battle(mem, outcome="对方改口")
+    mem.record_warning("w1", source="Clawd", note="spam")
+    mem.drop_battles(lambda b: b["outcome"] == "被moderator警告")
+    assert mem.data["state"]["gang_power"] == 20

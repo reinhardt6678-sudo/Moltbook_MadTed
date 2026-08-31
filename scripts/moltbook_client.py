@@ -8,6 +8,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import logging
 import os
 import threading
@@ -368,6 +369,94 @@ def author_name(obj: dict) -> str:
         elif isinstance(value, str) and value.strip():
             return value
     return _first_str(obj, ("author_name", "username", "agent_name"))
+
+
+def comment_score(comment: dict) -> int | None:
+    """这条评论拿了多少赞。**没有这个字段时返回 None，不是 0。**
+
+    两者差别很大：0 是"发出去了，没人点赞"，None 是"平台没告诉我们"。
+    记成 0 就等于凭空造了一个"零反响"的事实，而下游正要拿它去判姿态问题
+    （见 heartbeat._cold_cause）——这类假数据正是这个项目反复在修的那种 bug。
+
+    EN: the comment's score. Returns None when the field is absent — not 0.
+    Zero means "posted, nobody upvoted"; None means "the platform never said".
+    Recording None as 0 fabricates a "no reaction" fact, and the caller uses it
+    to attribute a cold thread to posture.
+    """
+    for key in ("score", "upvotes", "karma", "likes", "points"):
+        value = comment.get(key)
+        if isinstance(value, bool):
+            continue
+        if isinstance(value, int):
+            return value
+    return None
+
+
+# moderator 通知的识别词。命中任一即按"被警告"处理。
+#
+# 端点返回体的确切形状没有官方文档可查（和这个文件里其它字段一样，靠见到什么认什么），
+# 所以这里**故意宁可误报**：误报的代价是白停一轮 + 一条 -50 战绩，两者都能人工撤销；
+# 漏报的代价是顶着警告继续发，直到被封号。
+#
+# ⚠️ 这道网**没有被真实的警告验证过**。2026-08-31 实测线上 `/home` 的
+# activity_on_your_posts，10 条全是按帖子聚合的活动摘要
+# （post_id / post_title / submolt_name / new_notification_count / latest_at /
+# latest_commenters），一条都没有 type、kind 之类的字段——很可能 moderator 警告
+# 根本不走这条通道。所以它当前的实际效果是：不误伤（已验证），能不能真接住警告
+# （未验证）。真被警告过一次之后，把那条通知的实际形状补进这里。
+_MODERATOR_KEYWORDS = (
+    "moderat", "warning", "warn", "violation", "strike", "removed",
+    "takedown", "suspend", "spam", "rule", "policy",
+)
+_DEFAULT_MODERATOR_NAMES = ("clawd clawderberg", "clawd", "moderator", "modbot", "admin")
+
+
+def moderator_names() -> tuple[str, ...]:
+    """算作 moderator 的账号名，可用 MADTED_MODERATOR_NAMES 覆盖（逗号分隔）。"""
+    raw = os.environ.get("MADTED_MODERATOR_NAMES", "").strip()
+    if not raw:
+        return _DEFAULT_MODERATOR_NAMES
+    return tuple(n.strip().lower() for n in raw.split(",") if n.strip())
+
+
+def is_moderator_warning(notification: dict) -> bool:
+    """这条通知是不是 moderator 的警告/删帖。
+
+    两路判据：通知类型字段里带 moderation/warning/violation 这类词，
+    或者发出者是 moderator 账号。任一命中即算。
+    """
+    if not isinstance(notification, dict):
+        return False
+    kind = " ".join(
+        str(notification.get(key, ""))
+        for key in ("type", "kind", "category", "event", "reason", "action")
+    ).lower()
+    if any(word in kind for word in _MODERATOR_KEYWORDS):
+        return True
+    sender = author_name(notification).lower()
+    return bool(sender) and sender in moderator_names()
+
+
+def notification_id(notification: dict) -> str:
+    """通知的稳定 id，用于"同一条警告只扣一次分"。
+
+    取不到 id 就用内容摘要兜底——宁可偶尔重复扣分，也不能因为没有 id
+    就把警告整条丢掉。
+    """
+    direct = _first_str(notification, ("id", "notification_id", "_id", "uuid"))
+    if direct:
+        return direct
+    body = notification_text(notification)
+    return f"digest:{hashlib.sha1(body.encode('utf-8')).hexdigest()[:16]}" if body else ""
+
+
+def notification_text(notification: dict) -> str:
+    """通知里能读到的正文，拼给日志和战绩备注用。"""
+    parts = [
+        str(notification.get(key, ""))
+        for key in ("message", "content", "body", "text", "title", "reason", "type")
+    ]
+    return " ".join(p for p in parts if p).strip()
 
 
 def parent_comment_id(comment: dict) -> str:

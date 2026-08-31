@@ -20,9 +20,11 @@
 ```bash
 pip install -r requirements.txt
 cp .env.example .env          # 填 MOLTBOOK_API_KEY 和 ANTHROPIC_API_KEY
-python -m pytest tests/ -q    # 229 个测试，不需要任何 key
+python -m pytest tests/ -q    # 285 个测试，不需要任何 key
 python scripts/preflight.py   # 上线前自检：密钥、端点、目录一次查完
 python scripts/heartbeat.py --dry-run              # 空跑，不真的发帖
+python scripts/heartbeat.py --queue                # 只攒草稿，等人过目
+python scripts/approve.py                          # 逐条看，点头的才发出去
 ```
 
 ## MadTed 的设计要点
@@ -133,11 +135,13 @@ python scripts/heartbeat.py --dry-run              # 空跑，不真的发帖
 | `scripts/memory.py` | 记忆与学习。杠力值、冷场五类归因、免战名单、角度统计、跨语言的结构信号权重。 |
 | `scripts/brain.py` | 调 Claude 生成内心独白与回复。人设文档在这里当 system prompt（带 prompt caching）。 |
 | `scripts/heartbeat.py` | 主流程：先跟进老讨论串 → 再开新杠 → 更新记忆。 |
+| `scripts/pending.py` · `scripts/approve.py` | 待审队列。`--queue` 把想说的话先攒起来，你逐条过目再决定。草稿要改的状态是**推迟**到批准那一刻落，不是丢掉。 |
+| `scripts/halt.py` | 停机闸。收到 moderator 警告就按住 agent，必须人工解闸——这是全项目唯一一个「再跑一轮期望收益为负」的状态。 |
 | `scripts/repair_memory.py` | 一次性维护：清掉读不到回复那阵子留下的假战绩（`冷场` 和 `一轮即止/对方停止回应` 两批），并重算派生名单。`--rebuild` 一条战绩都不删，只按新口径重放一遍——**改了统计口径之后要跑它**；`--prune-turns` 清掉对线记录里混进来的旁人发言。 |
 | `scripts/daily_report.py` | 每日战报。`--no-llm` 可只看原始统计。 |
 | `scripts/show_monologue.py` | 按人设格式打印当天内心独白。**想知道它为什么挑这条帖子就看这个。** |
 | `scripts/show_state.py` | 杠力值、进行中的对线、学到的东西。**Windows 上别直接 `type` json，会乱码。** |
-| `tests/` | 229 个单元测试，中英文样本都覆盖，纯逻辑不需要 key。 |
+| `tests/` | 285 个单元测试，中英文样本都覆盖，纯逻辑不需要 key。 |
 
 ```
 personas/contrarian-agent.md   # 人设 = system prompt（中文，被代码原样加载）

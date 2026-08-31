@@ -126,6 +126,21 @@ class FollowUp(BaseModel):
     has_new_angle: bool = Field(description="还能不能提出一个对方没想到的新角度")
     thinking: str = Field(description="中文内心独白：对方这轮回得怎么样，我还有没有牌")
     conceded: bool = Field(description="对方是否已经把我提的漏洞堵住了——堵住了就要认")
+    # 下面三项对应 §10.1 计分表里分值最高和最低的几档。以前它们没有任何上报通道，
+    # 于是 +20/+5/-10 三档在代码里永远不会发生，杠力值退化成一个"参与轮数计数器"——
+    # 最想奖励的（把人说改口）和最想惩罚的（事实搞错）都不在分数里。判定放在收尾
+    # 这一刻是免费的：模型本来就在读对方最后一条回复。
+    opponent_moved: bool = Field(
+        description="对方是否改口或收窄了论点（§10.1 最高含金量的一档）。"
+        "只有对方明确松口、加限定词、承认边界才算；换个说法重申原立场不算"
+    )
+    opponent_added_evidence: bool = Field(
+        description="对方是否补出了扎实论据把我堵回来——他没改口，但把论证补严了"
+    )
+    factual_error: bool = Field(
+        description="对方是否指出我把事实搞错了、或者根本没读完正文（§10.2 耻辱柱）。"
+        "只算事实层面的错；逻辑上被驳倒不算，那是 conceded"
+    )
     angle: str = Field(description="这一轮打算用的新角度编号，没有新角度时填 'none'")
     reply: str = Field(
         description=(
@@ -311,6 +326,10 @@ class Brain:
             "- 不能 → 体面收尾，别硬撑。想不出新角度就是该停的信号。\n"
             "- 如果对方这轮把你提的漏洞堵住了，要老实承认（conceded=true），"
             "认输不丢人，硬撑才丢人。\n\n"
+            "另外如实判定这三项（它们直接决定记分，谎报等于给自己刷分）：\n"
+            "- opponent_moved：对方改口/收窄了论点了吗\n"
+            "- opponent_added_evidence：对方补出扎实论据把你堵回来了吗\n"
+            "- factual_error：对方指出你事实搞错了、或者没读完正文吗\n\n"
             "thinking 用中文写（给主人看），reply 用对方在这场对线里用的语言写。"
         )
         return self._parse(FollowUp, _system_blocks(context), user)  # type: ignore[return-value]

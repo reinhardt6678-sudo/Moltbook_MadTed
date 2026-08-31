@@ -60,7 +60,13 @@ ANGLE_BAN_THRESHOLD = 0.35
 # 一个好角度记进「钝刀」、把一个正常对手记进「免战名单」，越学越偏。
 # 所以命中这一类的战绩不参与任何学习，只留档。
 COLD_CAUSE_LANGUAGE = "语言不通"
-COLD_CAUSES = ("对象型", "话题型", "角度型", "姿态型", COLD_CAUSE_LANGUAGE)
+
+# 「姿态型」冷场：评论被踩到负分之后没人接话。沉默的原因写在票数上——
+# 是这条评论的姿态招人烦，不是这一招钝、也不是这个对手不接招。
+# 以前代码里这一类从来没被赋值过，于是"被踩了 20 个负分"和"没人看见"
+# 在记忆里长得一模一样，都是一条 -2 的冷场，然后 §8.2 的归因去怪角度。
+COLD_CAUSE_POSTURE = "姿态型"
+COLD_CAUSES = ("对象型", "话题型", "角度型", COLD_CAUSE_POSTURE, COLD_CAUSE_LANGUAGE)
 
 # 结构信号（radar.py 的 L0 层）→ 是否引发了互动。
 # 和 radar-keywords.json 的词表学习不同，这里学到的东西**跨语言可迁移**：
@@ -103,6 +109,9 @@ def _empty_memory() -> dict[str, Any]:
         "restraint_log": [],
         "angle_ban": {"banned": None, "until": None},
         "keyword_stats": {},
+        # 已经扣过 -50 的 moderator 警告 id。同一条通知会在收件箱里躺很久，
+        # 没有这份名单的话，人工解除停机闸之后下一轮会把它再扣一遍。
+        "warned_ids": [],
     }
 
 
@@ -159,7 +168,7 @@ class Memory:
         angle_used: str,
         rounds: int,
         outcome: str,
-        reactions: int = 0,
+        reactions: int | None = None,
         note: str = "",
         cold_cause: str = "",
         signals: dict[str, Any] | None = None,
@@ -168,6 +177,11 @@ class Memory:
 
         cold_cause 是冷场归因（§8.2）。命中 COLD_CAUSE_LANGUAGE 的战绩只留档、
         不参与学习——回复发错语言导致的沉默，怪不到角度和对手头上。
+        命中 COLD_CAUSE_POSTURE 的只跳过角度统计：票数说明问题出在姿态上，
+        给这一招记一次"无效"会把好招打进钝刀。
+
+        reactions 是自己那条评论拿到的票数，None 表示平台没给这个字段——
+        和 0 分要分开，见 moltbook_client.comment_score。
 
         signals 是开杠时 radar 记录的结构信号，用于跨语言的选题学习。
         """
@@ -199,7 +213,8 @@ class Memory:
             self.data["battles"][-1]["note"] = f"{note}（{log_note}）" if note else log_note
             return delta
 
-        self._update_angle_stats(angle_used, effective=engaged)
+        if cold_cause != COLD_CAUSE_POSTURE:
+            self._update_angle_stats(angle_used, effective=engaged)
         self._update_signal_stats(signals or {}, engaged=engaged)
         self._learn_from_outcome(opponent, topic_type, angle_used, outcome, rounds)
         return delta
@@ -233,7 +248,8 @@ class Memory:
             if battle.get("cold_cause") == COLD_CAUSE_LANGUAGE:
                 continue
             engaged = battle["rounds"] >= 2 or battle["outcome"] == "对方改口"
-            self._update_angle_stats(battle["angle_used"], effective=engaged)
+            if battle.get("cold_cause") != COLD_CAUSE_POSTURE:
+                self._update_angle_stats(battle["angle_used"], effective=engaged)
             self._update_signal_stats(battle.get("signals", {}), engaged=engaged)
             self._learn_from_outcome(
                 battle["opponent"],
@@ -377,6 +393,33 @@ class Memory:
         # 对方一旦有回应，就从免战名单里放出来
         if outcome != "冷场" and opponent in lists["truce_list"]:
             lists["truce_list"].remove(opponent)
+
+    # ---------- moderator 警告（人设 §10.1，-50） ----------
+
+    def already_warned(self, warning_id: str) -> bool:
+        return bool(warning_id) and warning_id in self.data.get("warned_ids", [])
+
+    def record_warning(self, warning_id: str, *, source: str, note: str) -> int:
+        """记一条 moderator 警告，返回扣掉的分（重复的返回 0）。
+
+        走 record_battle 而不是直接改分数，是为了让它跟战绩一样能被
+        rebuild_derived_state 重放、被 repair_memory 撤销——-50 是全表最重的
+        一档，误判必须撤得回来。angle 填 "none"，所以不会污染任何一招的统计。
+        """
+        if self.already_warned(warning_id):
+            return 0
+        delta = self.record_battle(
+            post_id=warning_id,
+            topic_type="平台规则",
+            opponent=source or "moderator",
+            angle_used="none",
+            rounds=0,
+            outcome="被moderator警告",
+            note=note[:200],
+        )
+        if warning_id:
+            self.data.setdefault("warned_ids", []).append(warning_id)
+        return delta
 
     # ---------- 忍住了计数器（人设 §10.6） ----------
 

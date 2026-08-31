@@ -188,6 +188,32 @@ python scripts/heartbeat.py --dry-run --max-new 2 --verbose
 
 ---
 
+## 第三步半：想再稳一点，用待审队列
+
+空跑和真跑之间还有一档：**`--queue` 攒草稿，你逐条过目，点头的才发出去。**
+
+```bash
+python scripts/heartbeat.py --queue      # 照常选题、照常写回复，但一条都不发
+python scripts/approve.py                # 逐条看：[y] 发 / [n] 否决 / [s] 留着 / [q] 退出
+python scripts/approve.py --list         # 只看队列里有什么
+python scripts/approve.py --clear        # 全部否决，清空队列
+```
+
+它和空跑的区别在于**状态是推迟、不是丢掉**：空跑跑完盘上一个字节都不变，
+而排队模式下，这条草稿要改的讨论串、要记的战绩、要扣的额度，全都攒在
+`memory/pending.jsonl` 里，等你点头那一刻才落。所以批准之后，MadTed
+知道自己参与过这条串，下一轮会正常跟进——不会把同一个帖子重新深挖一遍。
+
+什么时候值得开着它跑：
+
+- **刚上线的头几天**——你还不知道它会说出什么
+- **刚改完人设文档**——§4 的语气改一个词，输出可能变很多
+- **刚换过模型**——换 `--model` 之后行为会飘
+
+稳定之后就可以摘掉：定时任务里挂着 `--queue` 而没人去批，等于 agent 停摆。
+
+---
+
 ## 第四步：正式上线
 
 确认空跑没问题后，去掉 `--dry-run`：
@@ -367,6 +393,30 @@ journalctl -u madted.service -f        # 看日志，不用自己重定向
 
 ---
 
+## 踩到红线之后：停机闸
+
+收到 moderator 警告（人设 §10.1 记 -50，全表最重的一档）时，MadTed 会
+**当场停手并落一道闸**：记一条 -50 的战绩，写下 `memory/halt.json`，
+然后这一轮以及之后的每一轮都不再发任何东西。
+
+```bash
+python scripts/halt.py           # 看闸落着没有、为什么落的
+python scripts/halt.py --clear   # 确认处理完平台那边的问题之后，人工解闸
+```
+
+**为什么不设自动过期**：自动解闸等于把"人看过了吗"这个问题偷偷回答成"看过了"，
+而这恰恰是唯一一次需要人来判断的场合。其余所有异常（拉不到 feed、模型截断、
+额度耗尽）下一轮都能自愈，只有这一个不行——顶着警告继续发，只会让情况变坏。
+
+被闸挡住的那一轮退出码是 **3**（配置错是 2），cron 日志里一眼能看出区别。
+`preflight.py` 也会把它报成 FAIL——否则现象是"每轮都正常退出、就是什么都没发"，
+没有报错，只有沉默，那是最难查的一类问题。
+
+解闸之后同一条通知不会再次落闸：扣过分的警告 id 记在 `memory/madted-memory.json`
+的 `warned_ids` 里，不然主人清一次、下一轮读到同一条又把自己关回去，闸永远解不开。
+
+---
+
 ## 日常使用
 
 ```bash
@@ -410,6 +460,8 @@ python scripts/show_state.py --threads   # 只看进行中的对线
 | `scripts/moltbook_client.py` | Moltbook API 封装。限流、重试、冷却都在这里。**改端点只改这个文件。** |
 | `scripts/radar.py` | 杠点雷达 **L0**。纯逻辑结构层：emoji 密度、有无出处、赞评比、代码块。红线否决在这一层。 |
 | `scripts/triage.py` | 杠点雷达 **L1**。Haiku 批量语义粗筛，判断论证结构缺陷。`--no-triage` 可关。 |
+| `scripts/pending.py` · `scripts/approve.py` | 待审队列：`--queue` 攒草稿，`approve.py` 逐条过目。状态推迟到批准那一刻才落。 |
+| `scripts/halt.py` | 停机闸。收到 moderator 警告就按住，必须人工 `--clear` 才继续。 |
 | `scripts/budget.py` | 滚动 24 小时评论额度，**落盘**。cron 每轮都是新进程，只有它记得住一天发过多少条。 |
 | `scripts/memory.py` | 记忆与学习。杠力值、冷场归因、免战名单、角度统计。 |
 | `scripts/brain.py` | 调 Claude 生成内心独白和回复。人设文档在这里被当 system prompt 用。 |

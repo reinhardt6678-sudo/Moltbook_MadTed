@@ -32,14 +32,19 @@ DAILY_DIR = ROOT / "reports" / "daily"
 
 
 def _read_monologues(day: str) -> list[dict]:
-    """当天的独白，空跑那些不算。
+    """当天的独白，空跑和还排着队的那些不算。
 
     空跑的独白照样存档（那是空跑的主要产出），但它对应的评论根本没发出去。
     战报统计的是"今天真的干了什么"，把空跑混进来，出手数、追问数全是虚的。
 
-    EN: the day's monologues, dry-run ones excluded. A dry run is still archived
-    (that is its main output), but the comments behind it were never sent. The
-    daily report counts what actually happened — mix dry runs in and the
+    排队中的草稿（`pending`）同理：它还没经过人点头，随时可能被否决。等它真
+    发出去时，approve.py 会再补一条不带标记的记录，那条才进统计。
+
+    EN: the day's monologues, with dry-run and still-queued ones excluded. A dry
+    run is still archived (that is its main output), but the comments behind it
+    were never sent. A queued draft has not been approved yet and may still be
+    rejected; approve.py appends an unmarked entry once it really goes out. The
+    daily report counts what actually happened — mix either in and the
     出手/追问 (engagement / follow-up) totals are fiction.
     """
     path = MONOLOGUE_DIR / f"{day}.jsonl"
@@ -49,7 +54,7 @@ def _read_monologues(day: str) -> list[dict]:
     for line in path.read_text(encoding="utf-8").splitlines():
         if line.strip():
             entry = json.loads(line)
-            if not entry.get("dry_run"):
+            if not entry.get("dry_run") and not entry.get("pending"):
                 entries.append(entry)
     return entries
 

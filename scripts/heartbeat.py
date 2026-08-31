@@ -17,9 +17,13 @@
 用法：
     python scripts/heartbeat.py                # 正常跑
     python scripts/heartbeat.py --dry-run      # 不真的发帖，只打印
+    python scripts/heartbeat.py --queue        # 攒成待审草稿，等 approve.py 点头
     python scripts/heartbeat.py --max-new 2    # 限制本轮最多开 2 个新杠
     python scripts/heartbeat.py --daily-comments 30   # 收紧 24 小时总额度
     python scripts/heartbeat.py --no-triage    # 跳过 L1，只用 L0 排序
+
+三种出口的区别：dry-run 什么都不落盘，队列模式把状态推迟到批准那一刻落，
+正常跑当场落。被 moderator 警告过之后（见 halt.py）三种都不跑。
 """
 
 from __future__ import annotations
@@ -34,17 +38,23 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
+import halt  # noqa: E402
+import pending as pending_queue  # noqa: E402
 from brain import Brain, FollowUp, Monologue, is_usable_reply  # noqa: E402
 from budget import DEFAULT_DAILY_COMMENTS, CommentBudget  # noqa: E402
 from config import force_utf8_stdio, load_dotenv  # noqa: E402
-from memory import COLD_CAUSE_LANGUAGE, Memory  # noqa: E402
+from memory import COLD_CAUSE_LANGUAGE, COLD_CAUSE_POSTURE, Memory  # noqa: E402
 from moltbook_client import (  # noqa: E402
     MoltbookClient,
     MoltbookError,
     agent_self_name,
     author_name,
     comment_id,
+    comment_score,
+    is_moderator_warning,
+    notification_id,
     notification_post_id,
+    notification_text,
     parent_comment_id,
 )
 import radar  # noqa: E402
@@ -109,12 +119,14 @@ def _save_threads(threads: dict, *, dry_run: bool = False) -> None:
     )
 
 
-def _append_monologue(entry: dict, *, dry_run: bool = False) -> None:
+def _append_monologue(entry: dict, *, dry_run: bool = False, queued: bool = False) -> None:
     """内心独白按天存档，日报和主人都从这里读。
 
     空跑照写——独白正是空跑最有价值的产出，而且这份存档只被日报和
     show_monologue 读，不进任何决策路径，写了不会反过来影响下一轮选题。
-    但要打上 dry_run 标记：没发出去的评论不能在战报里冒充战绩。
+    但要打上标记：没发出去的评论不能在战报里冒充战绩。排队中的草稿同理，
+    用的是 `pending` 标记——它和空跑的区别在于**还有可能**发出去，
+    真发出去时 approve.py 会再补一条不带标记的，那条才算数。
 
     EN: the inner monologue, archived by day; the daily report and the owner
     both read it from here. Dry runs still write — the monologue is the whole
@@ -128,7 +140,11 @@ def _append_monologue(entry: dict, *, dry_run: bool = False) -> None:
     # 标记放最后，免得被 entry 里 model_dump 展开出来的同名字段盖掉
     # EN: marker goes last so a same-named field expanded out of model_dump
     # cannot shadow it
-    payload = {**entry, "dry_run": True} if dry_run else entry
+    payload = dict(entry)
+    if dry_run:
+        payload["dry_run"] = True
+    if queued:
+        payload["pending"] = True
     with open(path, "a", encoding="utf-8") as fh:
         fh.write(json.dumps(payload, ensure_ascii=False) + "\n")
 
@@ -184,22 +200,71 @@ def _self_name(client: MoltbookClient) -> str:
     return name
 
 
-def _inbox_hints(client: MoltbookClient) -> set[str]:
+def _fetch_inbox(client: MoltbookClient) -> list[dict]:
+    """收件箱条目。拉不到就返回空列表并记一行——收件箱只是加速器，不是命门。"""
+    try:
+        return client.get_inbox_activity()
+    except MoltbookError as exc:
+        log.warning("拉取收件箱失败（%s），改为直接轮询各讨论串的评论区", exc)
+        return []
+
+
+def _inbox_hints(client: MoltbookClient, *, activity: list[dict] | None = None) -> set[str]:
     """收件箱点到名的帖子 id，仅用于决定先轮询谁。
 
     拿不到就返回空集合——收件箱**只是加速器**，不再是能不能看见回复的开关。
     之前那版把它当唯一入口：端点 404、字段名对不上、或者主人在网页端把通知
     点成已读，都会让 agent 一条回复都看不见，然后把满帖子的回复记成冷场。
-    """
-    try:
-        activity = client.get_inbox_activity()
-    except MoltbookError as exc:
-        log.warning("拉取收件箱失败（%s），改为直接轮询各讨论串的评论区", exc)
-        return set()
 
-    hints = {notification_post_id(n) for n in activity}
+    activity 由 run_cycle 传进来复用同一次请求——那边要先拿它扫 moderator 警告。
+    """
+    items = _fetch_inbox(client) if activity is None else activity
+    hints = {notification_post_id(n) for n in items}
     hints.discard("")
     return hints
+
+
+def _handle_moderator_warnings(activity: list[dict], *, dry_run: bool = False) -> bool:
+    """收件箱里有没有 moderator 的新警告。有就记 -50、落停机闸，返回 True。
+
+    为什么这件事排在整轮最前面、而不是跟其它通知一起顺手处理：被警告之后再发的
+    每一条都在加重情况，所以判定必须发生在**任何一次 create_comment 之前**。
+    人设 §10.1 给它 -50，是全表最重的一档，比任何一场对线赢回来的都多。
+
+    **只对没记过的警告落闸。**通知会在收件箱里躺很久，不做这层过滤的话，
+    主人解完闸、下一轮读到同一条通知，又立刻把自己关回去，闸永远解不开。
+    memory 里的 warned_ids 就是那份"这条已经处理过了"的账。
+
+    这里自己开一个 Memory（而且只在真有警告时才开）：主流程那个在队列模式下
+    是不落盘的，而警告和草稿不一样——草稿还没发出去，警告已经发生了。
+    空跑仍然一个字节都不写，只把该说的话喊出来。
+    """
+    warnings = [n for n in activity if is_moderator_warning(n)]
+    if not warnings:
+        return False
+
+    mem = Memory(dry_run=dry_run)
+    fresh: list[tuple[str, str]] = []
+    for item in warnings:
+        wid = notification_id(item)
+        note = notification_text(item)[:160] or "（无正文）"
+        if mem.already_warned(wid):
+            log.info("moderator 警告 %s 之前已经处理过，不重复落闸", wid or "(无 id)")
+            continue
+        delta = mem.record_warning(wid, source=author_name(item) or "moderator", note=note)
+        log.error("收到 moderator 警告（%+d 分）：%s", delta, note)
+        fresh.append((wid, note))
+
+    if not fresh:
+        return False
+
+    mem.save()
+    halt.raise_halt(
+        "收到 moderator 警告：" + "；".join(note for _, note in fresh),
+        warning_ids=[wid for wid, _ in fresh if wid],
+        dry_run=dry_run,
+    )
+    return True
 
 
 def _identify_self(
@@ -224,6 +289,29 @@ def _identify_self(
     if own and own != {rid for rid in thread.get("own_comment_ids", []) if rid}:
         thread["own_comment_ids"] = sorted(own)
     return own, own_texts
+
+
+def _record_own_reactions(thread: dict, replies: list[dict], own: set[str]) -> None:
+    """把自己那几条评论拿到的票数记到讨论串上。
+
+    这是**唯一一个外部**的质量信号。其余所有学习（利刃/钝刀、signal_bias、
+    免战名单）都建立在"对方回没回我"上，而那是个很粗的代理指标：一条被踩到
+    -20 的评论和一条没人看见的评论，在记忆里长得一模一样，都是一条 -2 的冷场。
+    票数能把这两种沉默分开（见 _cold_cause）。
+
+    评论区本来就整棵拉下来了，自己那几条就在里面，这里只是别再把它扔掉。
+    平台没给票数字段时 comment_score 返回 None，那就什么都不记——记成 0
+    等于编一个"零反响"的事实出来。
+    """
+    known = [
+        score
+        for reply in replies
+        if comment_id(reply) in own
+        for score in [comment_score(reply)]
+        if score is not None
+    ]
+    if known:
+        thread["reactions"] = sum(known)
 
 
 def _aimed_at_me(reply: dict, by_id: dict[str, dict], own: set[str], mention: str) -> bool:
@@ -268,6 +356,7 @@ def _new_replies_for(
 
     seen = set(thread.get("seen_reply_ids", []))
     own, own_texts = _identify_self(thread, replies, self_name)
+    _record_own_reactions(thread, replies, own)
     by_id = {comment_id(r): r for r in replies if comment_id(r)}
     mention = f"@{self_name}".lower() if self_name else ""
 
@@ -328,7 +417,9 @@ def follow_up_threads(
     threads: dict,
     *,
     dry_run: bool,
+    queue_mode: bool = False,
     budget: CommentBudget | None = None,
+    inbox_hints: set[str] | None = None,
 ) -> tuple[int, set[str]]:
     """检查已参与的讨论串有没有新回复，有新角度就追，没有就收尾。
 
@@ -344,7 +435,8 @@ def follow_up_threads(
     sharp, blunt, banned = mem.angle_preference()
 
     self_name = _self_name(client)
-    hints = _inbox_hints(client)
+    hints = _inbox_hints(client) if inbox_hints is None else inbox_hints
+    queued_posts = pending_queue.post_ids() if queue_mode else set()
 
     open_threads = [(pid, t) for pid, t in threads.items() if not t.get("closed")]
     # 通知点过名的排前面，轮询上限被打满时先保证这些
@@ -358,6 +450,9 @@ def follow_up_threads(
         open_threads = open_threads[:MAX_THREAD_POLLS]
 
     for post_id, thread in open_threads:
+        if post_id in queued_posts:
+            log.info("%s 已有草稿在等审批，本轮跳过", post_id)
+            continue
         new_replies = _new_replies_for(client, post_id, thread, self_name)
         if new_replies is None:
             continue
@@ -374,7 +469,13 @@ def follow_up_threads(
         if thread["rounds"] >= MAX_ROUNDS:
             log.info("%s 已达软保底 %d 轮，收尾", post_id, MAX_ROUNDS)
             _commit_replies(thread, new_replies, pending)
-            _close_thread(mem, thread, post_id, outcome="多轮激辩", note="到软保底轮数，主动收尾")
+            _close_thread(
+                mem,
+                thread,
+                post_id,
+                outcome=_closing_outcome(thread, None, thread["rounds"]),
+                note="到软保底轮数，主动收尾",
+            )
             handled += 1
             continue
 
@@ -412,14 +513,20 @@ def follow_up_threads(
                 "thinking": decision.thinking,
                 "has_new_angle": decision.has_new_angle,
                 "conceded": decision.conceded,
+                "opponent_moved": decision.opponent_moved,
+                "opponent_added_evidence": decision.opponent_added_evidence,
+                "factual_error": decision.factual_error,
                 "angle": decision.angle,
                 "reply": decision.reply,
             },
             dry_run=dry_run,
+            queued=queue_mode,
         )
 
         if dry_run:
             log.info("[dry-run] 追问 %s: %s", post_id, decision.reply)
+        elif queue_mode:
+            log.info("[queue] 追问 %s 已排队待审: %s", post_id, decision.reply)
         else:
             try:
                 result = client.create_comment(post_id, decision.reply)
@@ -439,11 +546,43 @@ def follow_up_threads(
         thread["rounds"] += 1
         if decision.angle != "none":
             thread.setdefault("used_angles", []).append(decision.angle)
+        _remember_verdict_flags(thread, decision)
         handled += 1
 
+        closing = None
         if not decision.has_new_angle:
-            outcome = "我认输" if decision.conceded else "多轮激辩"
+            outcome = _closing_outcome(thread, decision, thread["rounds"])
+            closing = {"outcome": outcome, "note": decision.thinking[:120]}
             _close_thread(mem, thread, post_id, outcome=outcome, note=decision.thinking[:120])
+
+        if queue_mode:
+            # 上面那些改动这轮全在内存里（队列模式和空跑一样不落盘），
+            # 所以要把"批准之后该怎么改讨论串"原样带走。带的是**增量**不是整份
+            # 快照：审批可能发生在几小时后，那时这条串在盘上大概率已经动过了，
+            # 拿一份旧快照盖回去会把中间发生的事情抹掉。
+            pending_queue.append(
+                {
+                    "kind": "follow_up",
+                    "post_id": post_id,
+                    "title": thread.get("title", ""),
+                    "opponent": thread["opponent"],
+                    "angle": decision.angle,
+                    "thinking": decision.thinking,
+                    "reply": decision.reply,
+                    "commit": {
+                        "opponent_turns": pending,
+                        "seen_reply_ids": [
+                            comment_id(r) for r in new_replies if comment_id(r)
+                        ],
+                        "reply_language": thread["reply_language"],
+                        "angle": decision.angle,
+                        "verdict_flags": [
+                            f for f in _VERDICT_FLAGS if getattr(decision, f, False)
+                        ],
+                        "close": closing,
+                    },
+                }
+            )
 
     return handled, checked
 
@@ -457,6 +596,64 @@ def _remember_own_comment(thread: dict, result: dict | None) -> None:
     rid = comment_id(result or {})
     if rid:
         thread.setdefault("own_comment_ids", []).append(rid)
+
+
+_VERDICT_FLAGS = ("factual_error", "opponent_moved", "opponent_added_evidence")
+
+
+def _remember_verdict_flags(thread: dict, decision: FollowUp) -> None:
+    """把这一轮的判定记在讨论串上，一旦为真就不再翻回去。
+
+    对方在第 2 轮改了口、对线又往下走了 4 轮，这场依然是「对方改口」——
+    只看收尾那一轮的话，中间发生过的最高含金量的一次会被整场丢掉，
+    因为收尾时模型看的是对方**最后**一条回复。事实搞错了同理，
+    §10.2 的耻辱柱要的就是这个记录，不能因为后面几轮扳回来了就抹掉。
+    """
+    for flag in _VERDICT_FLAGS:
+        if getattr(decision, flag, False):
+            thread[flag] = True
+
+
+def _closing_outcome(thread: dict, decision: FollowUp | None, rounds: int) -> str:
+    """收尾这一刻该记哪一档（人设 §10.1 计分表）。
+
+    在这之前这里只有两档——`"我认输" if conceded else "多轮激辩"`——而计分表有
+    九档。结果是分值最高的「对方改口」(+20) 和最低的「被 moderator 警告」(-50)、
+    「硬撑」(-15)、「杠错了」(-10) 全都不可能发生：15 场实战里只出现过 4 种战果。
+    杠力值因此退化成了"参与轮数的加权计数"，而不是质量分——最想奖励的和最想
+    惩罚的都不在分数里。
+
+    判定顺序是有讲究的，不是随手排的：
+
+    1. **杠错了排最前**。§10.1 给它 -10 是冲着"没读完正文/事实搞错"去的，
+       跟认不认账无关——错误本身要付代价。而 §10.2 的耻辱柱正是收集这一类。
+    2. **认输排在对方改口前面**。两者理论上可以同时为真（一场里各让一步），
+       这时取对自己不利的那个：不然模型只要顺手把 opponent_moved 报成 true，
+       就能把一次认输刷成 +20。自评的分数，规则必须偏向不利于自己的那一侧。
+       §10.1 写明"认输不扣分——这是原则"，所以它是 0，不是负分。
+    3. **硬撑**：模型自己说了没有新角度（has_new_angle=False），却仍然报了一个
+       进攻角度。§6.3 说得很清楚："想不出新角度就是该停的信号"，§7 那条更直白：
+       只能靠加重语气而非新论点撑场面，就是角度用完了。所以这个组合就是
+       "明知理亏还硬撑"在代码里唯一诚实的判据。
+    4. **多轮激辩要求 ≥3 轮**，照 §10.1 表里写的。够不上就是「一轮即止」(+1)，
+       以前不看轮数一律记 +10，等于把两轮就散场的对线当成激辩。
+
+    decision=None 是撞上软保底轮数那条路：没有本轮判定，只看这场攒下来的旗标。
+    """
+    def flag(name: str) -> bool:
+        return bool(thread.get(name)) or bool(getattr(decision, name, False))
+
+    if flag("factual_error"):
+        return "杠错了"
+    if decision is not None and decision.conceded:
+        return "我认输"
+    if flag("opponent_moved"):
+        return "对方改口"
+    if flag("opponent_added_evidence"):
+        return "对方补出扎实论据"
+    if decision is not None and not decision.has_new_angle and decision.angle != "none":
+        return "硬撑"
+    return "多轮激辩" if rounds >= 3 else "一轮即止"
 
 
 def _cold_cause(thread: dict) -> str:
@@ -476,6 +673,17 @@ def _cold_cause(thread: dict) -> str:
             post_lang,
         )
         return COLD_CAUSE_LANGUAGE
+
+    # 被踩到负分之后的沉默，原因写在票数上：是这条评论招人烦，不是这一招钝。
+    # 归成「姿态型」之后，这条战绩就不再给角度记一次"无效"（见 memory.record_battle）。
+    reactions = thread.get("reactions")
+    if isinstance(reactions, int) and reactions < 0:
+        log.warning(
+            "讨论串 %s：自己那条评论被踩到 %d 分，冷场归因为姿态型",
+            thread.get("title", "")[:20],
+            reactions,
+        )
+        return COLD_CAUSE_POSTURE
     return ""
 
 
@@ -488,6 +696,7 @@ def _close_thread(mem: Memory, thread: dict, post_id: str, *, outcome: str, note
         angle_used=thread.get("used_angles", ["unknown"])[0],
         rounds=thread["rounds"],
         outcome=outcome,
+        reactions=thread.get("reactions"),
         note=note,
         cold_cause=_cold_cause(thread) if outcome == "冷场" else "",
         signals=thread.get("signals", {}),
@@ -568,6 +777,7 @@ def open_new_battles(
     max_new: int,
     max_deliberate: int,
     dry_run: bool,
+    queue_mode: bool = False,
     triage: Triage | None = None,
     budget: CommentBudget | None = None,
 ) -> tuple[int, list[str]]:
@@ -597,8 +807,9 @@ def open_new_battles(
         log.error("拉取 feed 失败：%s", exc)
         return 0, []
 
-    # 已经参与过的帖子不再重复开杠
-    posts = [p for p in posts if str(p.get("id")) not in threads]
+    # 已经参与过、或者已经有草稿在等审批的帖子，都不再重复开杠
+    engaged_ids = set(threads) | (pending_queue.post_ids() if queue_mode else set())
+    posts = [p for p in posts if str(p.get("id")) not in engaged_ids]
 
     # ---- L0：结构层 ----
     accepted, rejected = radar.rank_feed(
@@ -678,6 +889,7 @@ def open_new_battles(
                 **monologue.model_dump(),
             },
             dry_run=dry_run,
+            queued=queue_mode,
         )
 
         if monologue.verdict != "出手":
@@ -696,6 +908,8 @@ def open_new_battles(
         own_comment_ids: list[str] = []
         if dry_run:
             log.info("[dry-run] 对 %s 出手: %s", cand.post_id, monologue.reply)
+        elif queue_mode:
+            log.info("[queue] 对 %s 的出手已排队待审: %s", cand.post_id, monologue.reply)
         else:
             try:
                 result = client.create_comment(cand.post_id, monologue.reply)
@@ -742,6 +956,23 @@ def open_new_battles(
         engaged += 1
         log.info("已对《%s》出手（角度 %s / %s）", cand.title[:30], monologue.angle, post_language)
 
+        if queue_mode:
+            # 新杠的状态整份带走：批准之前盘上根本没有这条串，不存在会被覆盖的
+            # 中间改动。批准时如果发现这帖已经在盘上了（比如中途手工跑过一轮真跑），
+            # approve.py 会跳过，不会盖。
+            pending_queue.append(
+                {
+                    "kind": "deliberate",
+                    "post_id": cand.post_id,
+                    "title": cand.title,
+                    "opponent": cand.author,
+                    "angle": monologue.angle,
+                    "thinking": monologue.why_this_one,
+                    "reply": monologue.reply,
+                    "commit": {"thread": threads[cand.post_id]},
+                }
+            )
+
     return engaged, restraint
 
 
@@ -751,6 +982,7 @@ def open_new_battles(
 def run_cycle(
     *,
     dry_run: bool = False,
+    queue_mode: bool = False,
     max_new: int = 1,
     effort: str = "medium",
     model: str | None = None,
@@ -758,21 +990,47 @@ def run_cycle(
     use_triage: bool = True,
     triage_model: str | None = None,
     daily_comments: int | None = None,
-) -> None:
+) -> bool:
+    """跑一轮。返回 False 表示这轮被停机闸挡住了，什么都没做。"""
+    gate = halt.active()
+    if gate is not None:
+        log.error("⛔ 停机中，本轮一条都不发。\n%s", halt.describe(gate))
+        log.error("确认处理完之后解闸：python scripts/halt.py --clear")
+        return False
+
+    # 队列模式和空跑一样，这一轮不当场落盘——区别在于状态不是丢掉，
+    # 是推迟到 approve.py 批准那一刻才落（见 pending.py 顶上的说明）。
+    offline = dry_run or queue_mode
+
     client = MoltbookClient.from_env(dry_run=dry_run)
     brain = Brain(effort=effort, model=model)
     # L1 和 L2 共用一个 anthropic 客户端，省一次连接初始化
     triage = Triage(client=brain.client, model=triage_model) if use_triage else None
-    mem = Memory(dry_run=dry_run)
+
+    # 收件箱只拉一次，两个用途：先扫 moderator 警告，再拿来排轮询顺序。
+    # 警告必须在任何一次发送之前判掉。
+    activity = _fetch_inbox(client)
+    if _handle_moderator_warnings(activity, dry_run=dry_run):
+        log.error("=== heartbeat 中止：已落停机闸，本轮一条都没发 ===")
+        return False
+
+    mem = Memory(dry_run=offline)
     threads = _load_threads()
     # 落盘的额度，跨进程有效——每小时一轮时唯一挡得住"一天发爆"的东西
-    budget = CommentBudget(cap=daily_comments, dry_run=dry_run)
+    budget = CommentBudget(cap=daily_comments, dry_run=offline)
 
     log.info("=== heartbeat 开始 | 杠力值 %s (%s) | %s ===",
              mem.data["state"]["gang_power"], mem.data["state"]["rank"], budget.summary())
 
     followed, checked = follow_up_threads(
-        client, brain, mem, threads, dry_run=dry_run, budget=budget
+        client,
+        brain,
+        mem,
+        threads,
+        dry_run=dry_run,
+        queue_mode=queue_mode,
+        budget=budget,
+        inbox_hints=_inbox_hints(client, activity=activity),
     )
     log.info("阶段1：跟进了 %d 个讨论串（查清 %d 个）", followed, len(checked))
 
@@ -786,6 +1044,7 @@ def run_cycle(
         max_new=max_new,
         max_deliberate=max_deliberate,
         dry_run=dry_run,
+        queue_mode=queue_mode,
         triage=triage,
         budget=budget,
     )
@@ -798,16 +1057,27 @@ def run_cycle(
     # keeps evolving in process, so the logs and the monologue archive still see
     # a full cycle — it just leaves nothing behind on disk
     mem.save()
-    _save_threads(threads, dry_run=dry_run)
+    _save_threads(threads, dry_run=offline)
     log.info("=== heartbeat 结束 | 杠力值 %s | %s ===",
              mem.data["state"]["gang_power"], budget.summary())
+    if queue_mode:
+        waiting = len(pending_queue.load())
+        log.info("待审草稿 %d 条 —— 过一眼再发：python scripts/approve.py", waiting)
+    return True
 
 
 def main() -> None:
     # 日志里会原样带上帖子标题，而标题里什么 emoji 都可能有，得先把 stderr 定成 UTF-8
     force_utf8_stdio()
     parser = argparse.ArgumentParser(description="MadTed 的一次 heartbeat 周期")
-    parser.add_argument("--dry-run", action="store_true", help="不真的发评论，只打印")
+    # 两个都是"这轮不发"，但含义不同，同时给等于自相矛盾，让 argparse 直接拦掉
+    exits = parser.add_mutually_exclusive_group()
+    exits.add_argument("--dry-run", action="store_true", help="不真的发评论，只打印")
+    exits.add_argument(
+        "--queue",
+        action="store_true",
+        help="不直接发，攒成待审草稿等人过目（python scripts/approve.py）",
+    )
     parser.add_argument(
         "--max-new",
         type=int,
@@ -860,8 +1130,9 @@ def main() -> None:
     # 自动读 .env，这样 cron 和 Windows 都不用先 source
     load_dotenv()
     try:
-        run_cycle(
+        ran = run_cycle(
             dry_run=args.dry_run,
+            queue_mode=args.queue,
             max_new=args.max_new,
             effort=args.effort,
             model=args.model,
@@ -875,6 +1146,10 @@ def main() -> None:
         # 看着像崩溃，会被当成偶发故障放过去——这类问题得一眼看出是配置问题。
         log.error("%s", exc)
         raise SystemExit(2) from None
+    if not ran:
+        # 3 和"配置错"(2)分开：cron 的日志里要一眼看出这轮是被停机闸挡的，
+        # 不是崩了。被挡住的每一轮都该退非 0，否则监控会以为一切正常。
+        raise SystemExit(3)
 
 
 if __name__ == "__main__":

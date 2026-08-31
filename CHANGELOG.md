@@ -9,6 +9,72 @@ Each entry gives the Chinese line first, then the English one.
 
 ---
 
+## 2026-08-31
+
+- **计分表九档里有五档是死代码，杠力值因此量不出质量** —— `SCORE_TABLE` 列了九种战果，
+  收尾那行代码却只会产生四种（`"我认输" if conceded else "多轮激辩"`）。分值最高的
+  「对方改口」(+20) 和最低的「硬撑」(-15)、「杠错了」(-10) 从来没发生过一次——15 场
+  实战的分布正好印证。杠力值实际上退化成了参与轮数的加权计数：最想奖励的（把人说改口）
+  和最想惩罚的（明知理亏还硬撑）都不在分数里，而 §10.1 写明这套分值的设计意图就是
+  「让诚实在数值上优于嘴硬」。现在 `FollowUp` 多报三项判定，收尾时按 §10.1 整张表判；
+  判定一旦为真就记在讨论串上，对方在第 2 轮改口、对线又走了 4 轮，这场依然算改口。
+  「多轮激辩」也照表要求 ≥3 轮，两轮就散场的不再冒充 +10。
+  **Five of the nine score-table outcomes were dead code, so gang power measured the wrong thing**
+  — `SCORE_TABLE` lists nine outcomes; the closing line could only ever produce four. The highest
+  row (opponent moved, +20) and the lowest (stonewalling -15, factual error -10) had never once
+  fired, which the 15 recorded battles confirm exactly. Gang power had degenerated into a weighted
+  round counter: neither what the persona most wants to reward nor what it most wants to punish was
+  in the number, though §10.1 states the whole point of these values is to make honesty score better
+  than stubbornness. `FollowUp` now reports three more verdicts, the close is judged against the
+  full table, and a verdict sticks to the thread once true — an opponent who moved in round 2 still
+  counts even if the argument ran four more rounds. "Multi-round" now also requires the >=3 rounds
+  the table asks for.
+
+- **被 moderator 警告之后会继续发，直到有人发现** —— -50 是全表最重的一档，比任何一场
+  对线赢回来的都多，代码里却没有任何一处去发现它。收件箱本来每轮都在拉，只是没人看
+  那几条。现在警告会在**任何一次发送之前**判掉：记 -50、落下 `memory/halt.json`，
+  之后每一轮都不发东西，直到人工 `python scripts/halt.py --clear`。不设自动过期——
+  自动解闸等于把"人看过了吗"偷偷答成"看过了"。扣过分的警告 id 记在 `warned_ids` 里，
+  否则解闸之后下一轮读到同一条通知会把自己又关回去。
+  **A moderator warning kept the agent posting until a human noticed** — -50 is the heaviest row in
+  the table, more than any argument can win back, and nothing in the code looked for it. The inbox
+  was already being fetched every round; those entries were simply never read. The check now runs
+  before any send: it records the -50, writes `memory/halt.json`, and every later round posts
+  nothing until someone runs `python scripts/halt.py --clear`. It never expires on its own — an
+  automatic lift quietly answers "has a human looked at this?" with "yes". Charged warning ids are
+  kept in `warned_ids`, or clearing the gate would let the next round read the same notification and
+  lock itself back in.
+
+- **自己那条评论拿了多少票，一直被扔掉** —— radar 会读别人帖子的赞数，却从不读自己
+  评论的。评论区本来就整棵拉下来了，那个数字就在手边。代价是所有学习都建立在"对方回没回我"
+  这一个很粗的代理指标上：一条被踩到 -20 的评论和一条没人看见的评论，在记忆里长得一模一样，
+  都是一条 -2 的冷场，然后 §8.2 的归因去怪角度。现在票数记进战绩，被踩到负分之后的沉默
+  归为「姿态型」——§8.2 里本来就有这一类，只是代码从没赋值过——并且不再给那一招记一次
+  「无效」。平台没给票数字段时记 None 而不是 0：0 是"没人点赞"，None 是"平台没说"。
+  **The score on MadTed's own comments was being thrown away** — radar reads other people's upvotes
+  but never its own. The comment tree is already fetched in full; the number was right there. The
+  cost was that every learning signal rested on one coarse proxy, "did they reply": a comment
+  downvoted to -20 and a comment nobody saw looked identical in memory — both a -2 cold shoulder —
+  and §8.2 then blamed the angle. The score is now recorded, silence after a negative score is
+  attributed to posture (a category §8.2 always had and code never assigned), and that battle no
+  longer marks the angle ineffective. A missing score field records None, not 0: zero means nobody
+  upvoted, None means the platform never said.
+
+- **空跑和真跑之间没有"我先看一眼"这一档** —— 只有全不发和全直接发两个极端，而输出是
+  公开且撤不回的。新增 `--queue`：照常选题、照常写回复，但攒进 `memory/pending.jsonl`，
+  由 `python scripts/approve.py` 逐条过目，点头的才发。和空跑的区别是状态**推迟**而不是
+  丢掉——批准那一刻才落讨论串、战绩和额度，所以批准之后 MadTed 知道自己参与过这条串，
+  下一轮会正常跟进。排队中的帖子本轮不再重复深挖（L2 是最贵的一层），独白存档里打
+  `pending` 标记，不进战报统计。
+  **There was no "let me look first" setting between a dry run and a live one** — only send nothing
+  or send everything, for output that is public and cannot be taken back. `--queue` picks and writes
+  as usual but parks the drafts in `memory/pending.jsonl`; `python scripts/approve.py` walks through
+  them and only what you approve goes out. Unlike a dry run the state is deferred, not discarded:
+  the thread, the battle and the budget land at approval time, so an approved draft leaves MadTed
+  knowing it took part and following up normally next round. A post with a draft waiting is not
+  deliberated over again (L2 is the expensive layer), and queued monologues carry a `pending` marker
+  so they stay out of the daily report.
+
 ## 2026-08-24
 
 - **空跑不再往盘上写任何东西** —— 空跑不发评论，却照样把"这条我回过了"和扣掉的杠力值写进了

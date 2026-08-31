@@ -16,7 +16,9 @@ import pytest
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "scripts"))
 
+import halt  # noqa: E402
 import heartbeat  # noqa: E402
+import pending  # noqa: E402
 from brain import FollowUp, Monologue  # noqa: E402
 from budget import CommentBudget  # noqa: E402
 from memory import Memory  # noqa: E402
@@ -39,6 +41,8 @@ class FakeClient:
         self.replies_fail = replies_fail
         self.posted: list[tuple[str, str]] = []
         self.marked_read: list[str] = []
+        # 收件箱条目。默认空，测 moderator 警告的用例往里塞。
+        self.inbox: list[dict] = []
 
     def get_feed(self, **kwargs):
         return list(self._feed)
@@ -49,7 +53,7 @@ class FakeClient:
     def get_inbox_activity(self):
         if self.notifications_fail:
             raise MoltbookError("GET /notifications 失败: 404", 404, "")
-        return []
+        return list(self.inbox)
 
     def mark_post_read(self, post_id):
         self.marked_read.append(post_id)
@@ -154,6 +158,9 @@ def a_decision(**overrides) -> FollowUp:
         "has_new_angle": True,
         "thinking": "他偷换了前提",
         "conceded": False,
+        "opponent_moved": False,
+        "opponent_added_evidence": False,
+        "factual_error": False,
         "angle": "3.6",
         "reply": "你这是双标。",
     }
@@ -879,6 +886,10 @@ def _wire_cycle(monkeypatch, tmp_path):
         lambda **kw: CommentBudget(tmp_path / "budget.json", cap=5, dry_run=True),
     )
     monkeypatch.setattr(heartbeat, "THREADS_PATH", threads_path)
+    # 停机闸和待审队列也挪进 tmp。不挪的话测试会去读仓库里真实的
+    # memory/halt.json——本机停着机，整套测试就会集体"通过"却什么都没跑。
+    monkeypatch.setattr(halt, "HALT_PATH", tmp_path / "halt.json")
+    monkeypatch.setattr(pending, "PENDING_PATH", tmp_path / "pending.jsonl")
     return client, memory_path, threads_path
 
 
@@ -942,3 +953,246 @@ def test_dry_run_monologue_is_archived_but_marked(tmp_path, monkeypatch):
              next(tmp_path.glob("*.jsonl")).read_text(encoding="utf-8").splitlines()]
     assert lines[0]["dry_run"] is True
     assert "dry_run" not in lines[1]
+
+
+# ---------- 计分表：九档里以前只有四档会发生 ----------
+
+
+def test_opponent_changing_their_mind_is_the_top_score():
+    """把人说改口是 §10.1 里分值最高的一档，以前代码里根本产生不出来。"""
+    decision = a_decision(has_new_angle=False, opponent_moved=True)
+    assert heartbeat._closing_outcome({}, decision, rounds=4) == "对方改口"
+
+
+def test_conceding_beats_claiming_they_moved():
+    """两边都为真时取对自己不利的那个。
+
+    不这样排的话，模型只要顺手把 opponent_moved 报成 true，就能把一次认输
+    刷成 +20。自评的分数，规则必须偏向不利于自己的一侧。
+    """
+    decision = a_decision(has_new_angle=False, conceded=True, opponent_moved=True)
+    assert heartbeat._closing_outcome({}, decision, rounds=4) == "我认输"
+
+
+def test_factual_error_outranks_everything():
+    """事实搞错了 -10（§10.2 耻辱柱），认不认账都要付这个代价。"""
+    decision = a_decision(has_new_angle=False, conceded=True, factual_error=True)
+    assert heartbeat._closing_outcome({}, decision, rounds=6) == "杠错了"
+
+
+def test_no_new_angle_but_still_attacking_is_stubbornness():
+    """自己说没牌了，却还报着一个进攻角度——§6.3 说这就是该停的信号。"""
+    decision = a_decision(has_new_angle=False, angle="3.6")
+    assert heartbeat._closing_outcome({}, decision, rounds=5) == "硬撑"
+
+
+def test_graceful_close_is_not_stubbornness():
+    """体面收尾（angle=none）不算硬撑，够轮数就是多轮激辩。"""
+    decision = a_decision(has_new_angle=False, angle="none")
+    assert heartbeat._closing_outcome({}, decision, rounds=3) == "多轮激辩"
+
+
+def test_multi_round_needs_three_rounds():
+    """§10.1 写的是『引发多轮激辩（≥3 轮）』，两轮就散场的不算。
+
+    以前不看轮数一律记 +10，等于把一次两轮的交流当成激辩。
+    """
+    decision = a_decision(has_new_angle=False, angle="none")
+    assert heartbeat._closing_outcome({}, decision, rounds=2) == "一轮即止"
+
+
+def test_a_mid_thread_concession_survives_to_the_close():
+    """对方在中间某轮改了口，收尾时那一轮已经翻篇了，这场依然算改口。
+
+    收尾判定看的是对方**最后**一条回复，只看那一轮的话，整场里含金量最高的
+    一次会被丢掉。
+    """
+    thread = make_thread()
+    heartbeat._remember_verdict_flags(thread, a_decision(opponent_moved=True))
+    closing = a_decision(has_new_angle=False, angle="none", opponent_moved=False)
+    assert heartbeat._closing_outcome(thread, closing, rounds=5) == "对方改口"
+
+
+def test_the_soft_cap_close_also_uses_the_flags():
+    """撞上软保底轮数那条路没有本轮判定，但攒下来的旗标照样算数。"""
+    thread = make_thread(factual_error=True)
+    assert heartbeat._closing_outcome(thread, None, rounds=8) == "杠错了"
+
+
+def test_closing_outcome_reaches_memory(tmp_path):
+    """端到端：追问收尾时，新判定要真的变成一条对应分值的战绩。"""
+    mem = Memory(tmp_path / "mem.json")
+    client = FakeClient({"p1": [a_reply()]})
+    threads = {"p1": make_thread(rounds=3)}
+
+    heartbeat.follow_up_threads(
+        client,
+        FakeBrain(a_decision(has_new_angle=False, angle="none", opponent_moved=True)),
+        mem,
+        threads,
+        dry_run=False,
+    )
+
+    assert [b["outcome"] for b in mem.data["battles"]] == ["对方改口"]
+    assert mem.data["state"]["gang_power"] == 20
+
+
+# ---------- moderator 警告：唯一该急刹车的信号 ----------
+
+
+def _warning(**overrides) -> dict:
+    item = {"id": "w1", "type": "moderation_warning", "message": "Spam detected"}
+    item.update(overrides)
+    return item
+
+
+def test_moderator_warning_halts_the_cycle(tmp_path, monkeypatch):
+    """被警告之后一条都不许再发，并且落闸等人来看。"""
+    client, memory_path, _ = _wire_cycle(monkeypatch, tmp_path)
+    client.inbox = [_warning()]
+
+    assert heartbeat.run_cycle(max_new=1, use_triage=False) is False
+    assert client.posted == []
+    assert halt.active() is not None
+    assert json.loads(memory_path.read_text(encoding="utf-8"))["state"]["gang_power"] == 0
+
+
+def test_moderator_warning_costs_fifty(tmp_path, monkeypatch):
+    """-50 要真的记成一条能被 rebuild / repair 撤销的战绩，不是直接改分数。"""
+    client, memory_path, _ = _wire_cycle(monkeypatch, tmp_path)
+    client.inbox = [_warning()]
+    Memory(memory_path)  # 起点 0 分
+    heartbeat.run_cycle(max_new=1, use_triage=False)
+
+    battles = json.loads(memory_path.read_text(encoding="utf-8"))["battles"]
+    assert [b["outcome"] for b in battles] == ["被moderator警告"]
+    assert battles[0]["score_delta"] == -50
+    assert battles[0]["angle_used"] == "none"  # 不能污染任何一招的统计
+
+
+def test_a_handled_warning_does_not_halt_again(tmp_path, monkeypatch):
+    """解完闸之后，同一条通知还躺在收件箱里——不能把自己又关回去。
+
+    没有这层过滤的话，闸永远解不开：主人清一次，下一轮读到同一条又落一次。
+    """
+    client, _, _ = _wire_cycle(monkeypatch, tmp_path)
+    client.inbox = [_warning()]
+    heartbeat.run_cycle(max_new=1, use_triage=False)
+    halt.clear()
+
+    assert heartbeat.run_cycle(max_new=1, use_triage=False) is True
+    assert client.posted != []
+
+
+def test_a_raised_gate_blocks_the_next_cycle(tmp_path, monkeypatch):
+    """闸落着的时候，下一轮连 feed 都不该去拉。"""
+    client, _, _ = _wire_cycle(monkeypatch, tmp_path)
+    halt.raise_halt("测试用", warning_ids=["w1"])
+
+    assert heartbeat.run_cycle(max_new=1, use_triage=False) is False
+    assert client.posted == []
+
+
+def test_dry_run_does_not_raise_the_gate(tmp_path, monkeypatch):
+    """空跑一个字节都不写——闸也一样，它会在下次真跑时自己落下来。"""
+    client, _, _ = _wire_cycle(monkeypatch, tmp_path)
+    client.inbox = [_warning()]
+
+    assert heartbeat.run_cycle(dry_run=True, max_new=1, use_triage=False) is False
+    assert halt.active() is None
+
+
+# ---------- 自己那条评论的票数 ----------
+
+
+def test_own_comment_score_is_recorded():
+    """评论区本来就整棵拉下来了，自己那条的票数不该再扔掉。"""
+    client = FakeClient({"p1": [{"id": "own-1", "author": {"name": "MadTed"},
+                                 "content": "这个'一定'的证据是什么？", "score": -12}]})
+    threads = {"p1": make_thread()}
+
+    heartbeat.follow_up_threads(client, FakeBrain(None), FakeMemory(), threads, dry_run=False)
+
+    assert threads["p1"]["reactions"] == -12
+
+
+def test_missing_score_field_is_not_recorded_as_zero():
+    """平台没给票数就什么都不记——记成 0 等于编一个『零反响』的事实出来。"""
+    client = FakeClient({"p1": [{"id": "own-1", "author": {"name": "MadTed"},
+                                 "content": "这个'一定'的证据是什么？"}]})
+    threads = {"p1": make_thread()}
+
+    heartbeat.follow_up_threads(client, FakeBrain(None), FakeMemory(), threads, dry_run=False)
+
+    assert "reactions" not in threads["p1"]
+
+
+def test_downvoted_silence_is_attributed_to_posture():
+    """被踩到负分之后没人接话，锅在姿态上，不在角度上（§8.2）。"""
+    assert heartbeat._cold_cause(make_thread(reactions=-9)) == "姿态型"
+
+
+def test_plain_silence_has_no_posture_attribution():
+    """没被踩的沉默不该被扣上姿态的帽子。"""
+    assert heartbeat._cold_cause(make_thread(reactions=3)) == ""
+
+
+def test_reactions_reach_the_battle_record(tmp_path):
+    mem = Memory(tmp_path / "mem.json")
+    heartbeat._close_thread(
+        mem, make_thread(reactions=7), "p1", outcome="一轮即止", note=""
+    )
+    assert mem.data["battles"][0]["reactions"] == 7
+
+
+# ---------- 排队模式：先攒草稿，等人点头 ----------
+
+
+def test_queue_mode_posts_nothing_but_files_a_draft(tmp_path, monkeypatch):
+    client, _, _ = _wire_cycle(monkeypatch, tmp_path)
+
+    heartbeat.run_cycle(queue_mode=True, max_new=1, use_triage=False)
+
+    assert client.posted == []
+    drafts = pending.load()
+    assert {d["kind"] for d in drafts} == {"follow_up", "deliberate"}
+    assert all(d["reply"] for d in drafts)
+
+
+def test_queue_mode_leaves_disk_state_untouched(tmp_path, monkeypatch):
+    """状态是**推迟**到批准那一刻，不是当场落——这一轮盘上不该有任何变化。"""
+    _, memory_path, threads_path = _wire_cycle(monkeypatch, tmp_path)
+    before_memory = memory_path.read_bytes()
+    before_threads = threads_path.read_bytes()
+
+    heartbeat.run_cycle(queue_mode=True, max_new=1, use_triage=False)
+
+    assert memory_path.read_bytes() == before_memory
+    assert threads_path.read_bytes() == before_threads
+
+
+def test_a_queued_post_is_not_deliberated_again(tmp_path, monkeypatch):
+    """草稿还没批，下一轮不能把同一个帖子再深挖一遍。
+
+    L2 是最贵的一层，重复深挖既费钱，批准时还会对同一个帖子连发两条。
+    """
+    _, _, _ = _wire_cycle(monkeypatch, tmp_path)
+    heartbeat.run_cycle(queue_mode=True, max_new=1, use_triage=False)
+    first = len(pending.load())
+
+    heartbeat.run_cycle(queue_mode=True, max_new=1, use_triage=False)
+
+    assert len(pending.load()) == first
+
+
+def test_queued_monologue_is_marked_pending(tmp_path, monkeypatch):
+    """排队中的独白要打标记，否则战报会把还没发出去的当成战绩。"""
+    monkeypatch.setattr(heartbeat, "_append_monologue", _real_append_monologue)
+    monkeypatch.setattr(heartbeat, "MONOLOGUE_DIR", tmp_path / "monologue")
+    _wire_cycle(monkeypatch, tmp_path)
+
+    heartbeat.run_cycle(queue_mode=True, max_new=1, use_triage=False)
+
+    lines = (tmp_path / "monologue").glob("*.jsonl")
+    entries = [json.loads(l) for f in lines for l in f.read_text(encoding="utf-8").splitlines()]
+    assert entries and all(e["pending"] is True for e in entries)

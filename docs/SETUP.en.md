@@ -209,6 +209,35 @@ style). No code change needed — the persona document *is* the system prompt.
 
 ---
 
+## Step 3.5: For a steadier start, use the draft queue
+
+There is a third setting between a dry run and a live one: **`--queue` parks the drafts, you read
+each one, and only what you approve goes out.**
+
+```bash
+python scripts/heartbeat.py --queue      # picks and writes as usual, sends nothing
+python scripts/approve.py                # one at a time: [y] send / [n] reject / [s] keep / [q] quit
+python scripts/approve.py --list         # just show what is waiting
+python scripts/approve.py --clear        # reject everything, empty the queue
+```
+
+The difference from a dry run is that state is **deferred, not discarded**. A dry run leaves not one
+byte changed on disk. In queue mode, the thread a draft would advance, the battle it would record
+and the budget it would spend all wait in `memory/pending.jsonl` until you say yes. So once approved,
+MadTed knows it took part in that thread and follows up normally next round — it will not deliberate
+over the same post a second time.
+
+When it earns its keep:
+
+- **The first few days after going live** — you do not yet know what it will say
+- **Right after editing the persona** — one word in §4 can move the output a lot
+- **Right after switching models** — behaviour drifts when `--model` changes
+
+Take it off once things settle: a scheduled `--queue` with nobody approving is an agent standing
+still.
+
+---
+
 ## Step 4: Go live
 
 Once the dry run looks right, drop `--dry-run`:
@@ -406,6 +435,33 @@ machine was off is made up once after boot.
 
 ---
 
+## After crossing a line: the kill switch
+
+On a moderator warning (-50 in §10.1, the heaviest row in the table) MadTed **stops on the spot and
+raises a gate**: it records the -50, writes `memory/halt.json`, and neither that round nor any round
+after it sends anything.
+
+```bash
+python scripts/halt.py           # is the gate up, and why
+python scripts/halt.py --clear   # lift it by hand, once the platform side is sorted out
+```
+
+**Why it never expires on its own**: an automatic lift quietly answers the question "has a human
+looked at this?" with "yes" — and this is the one occasion that actually needs a human to judge.
+Every other failure (feed unreachable, truncated model output, budget exhausted) heals on the next
+round. This one does not: posting through a warning only makes it worse.
+
+A round blocked by the gate exits with code **3** (a configuration error is 2), so the cron log
+tells them apart at a glance. `preflight.py` reports it as a FAIL too — otherwise the symptom is
+"every round exits cleanly and nothing ever gets posted": no error, just silence, which is the
+hardest kind of problem to chase.
+
+Lifting the gate does not re-trigger it on the same notification: the ids of warnings already
+charged live in `warned_ids` inside `memory/madted-memory.json`. Without that ledger the owner
+clears the gate, the next round reads the same notification and locks itself straight back in.
+
+---
+
 ## Day-to-day use
 
 ```bash
@@ -449,6 +505,8 @@ python scripts/show_state.py --threads   # live exchanges only
 | `scripts/moltbook_client.py` | Moltbook API wrapper. Rate limiting, retries and cooldowns all live here. **Endpoint changes go in this file only.** |
 | `scripts/radar.py` | Target radar **L0**. Pure structural logic: emoji density, presence of a source, like/comment ratio, code blocks. Red-line vetoes happen at this layer. |
 | `scripts/triage.py` | Target radar **L1**. Haiku batch semantic triage, judging structural flaws in the argument. Disable with `--no-triage`. |
+| `scripts/pending.py` · `scripts/approve.py` | The draft queue: `--queue` parks drafts, `approve.py` walks you through them. State lands at approval time, not before. |
+| `scripts/halt.py` | The kill switch. A moderator warning holds the agent until a human runs `--clear`. |
 | `scripts/budget.py` | Rolling 24-hour comment budget, **persisted**. Every cron round is a new process; only this remembers how much was posted today. |
 | `scripts/memory.py` | Memory and learning. Contrarian score, silence attribution, truce list, angle statistics. |
 | `scripts/brain.py` | Calls Claude to generate the monologue and the reply. This is where the persona document is used as the system prompt. |

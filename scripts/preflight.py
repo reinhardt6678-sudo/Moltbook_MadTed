@@ -27,6 +27,7 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
+import halt  # noqa: E402
 from config import force_utf8_stdio, load_dotenv  # noqa: E402
 
 # 依赖的最低版本，和 requirements.txt 保持一致
@@ -230,6 +231,23 @@ def check_dirs(r: Report) -> None:
         )
     else:
         r.ok("运行时目录可写", "、".join(RUNTIME_DIRS))
+
+
+def check_halt_gate(r: Report) -> None:
+    """停机闸落着的时候，heartbeat 一条都不会发——自检必须说出来。
+
+    否则现象是"每轮都正常退出、就是什么都没发"，而这是最难查的一类问题：
+    没有报错，只有沉默。
+    """
+    state = halt.active()
+    if state is None:
+        r.ok("停机闸", "未停机")
+        return
+    r.fail(
+        "停机闸",
+        f"停机中（{state.get('raised_at') or '时间未知'}）：{state.get('reason') or '原因未记录'}",
+        "确认处理完平台那边的问题之后解闸：python scripts/halt.py --clear",
+    )
 
 
 def check_persona(r: Report) -> None:
@@ -458,6 +476,7 @@ def main() -> int:
     check_env_keys(r, injected)
     check_secret_not_tracked(r)
     check_dirs(r)
+    check_halt_gate(r)
     check_persona(r)
     check_keywords(r)
 
